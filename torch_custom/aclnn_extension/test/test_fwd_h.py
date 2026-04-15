@@ -18,7 +18,7 @@ torch.npu.set_compile_mode(jit_compile=False)
 
 np.random.seed(1)
 torch.manual_seed(1)
-torch.npu.set_device(2)
+torch.npu.set_device(0)
 
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 from typing import Optional
@@ -202,7 +202,7 @@ def get_cu_offsets(h_input, cu_seqlens):
     for seq in cu_seqlens:
         num_chunks += math.ceil((seq - curr_token) / h_input.chunk_size)
         curr_token = seq
-    return cu_seqlens.npu(), torch.zeros([num_chunks, 2]).to(cu_seqlens.dtype).npu()
+    return cu_seqlens.tolist(), torch.zeros([num_chunks, 2]).to(cu_seqlens.dtype).tolist()
 
 def gen_decay_data(h_input, cu_seqlens, chunk_offsets):
     base = torch.randint(-15, -5, [h_input.v_num_head])
@@ -275,6 +275,8 @@ if __name__ == "__main__":
     torch.npu.synchronize()
 
     print("before custom op")
+    print(input_tensor.chunk_offsets)
+    print(input_tensor.cu_seqlens)
     result = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
         input_tensor.k.npu(),
         input_tensor.w.npu(),
@@ -287,7 +289,7 @@ if __name__ == "__main__":
         chunk_size=gdn_fwd_h_input.chunk_size
     )
     print("after custom op")
-    torch.npu.synchronize()
+    torch_npu._C._npu_synchronize()
     print("after synchronize")
     save_data(input_tensor, output_tensor)
     result[0].cpu().view(torch.int16).numpy().tofile(os.path.join(WORKSPACE, "data", "h_npu.bin"))

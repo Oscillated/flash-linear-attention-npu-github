@@ -151,14 +151,19 @@ at::Tensor npu_prepare_wy_repr_bwd_da(const at::Tensor & k, const at::Tensor & v
     return std::make_tuple(dq, dk, dw, dg);
 }
 
-at::Tensor npu_chunk_fwd_o(const at::Tensor & q, const at::Tensor & k, const at::Tensor & v, const at::Tensor & h, const at::Tensor & g, double scale, const c10::optional<at::Tensor> & cu_seqlens, const c10::optional<at::Tensor> & chunk_indices, c10::optional<int64_t> chunk_size)
+at::Tensor npu_chunk_fwd_o(
+    const at::Tensor & q, 
+    const at::Tensor & k, 
+    const at::Tensor & v, 
+    const at::Tensor & h, 
+    const at::Tensor & g, 
+    double scale, 
+    at::OptionalIntArrayRef cu_seqlens, 
+    at::OptionalIntArrayRef chunk_indices, 
+    c10::optional<int64_t> chunk_size)
 {
     // 创建输出tensor
     at::Tensor o = at::empty_like(v);
-
-    // optional tensor处理
-    const at::Tensor &cu_seqlens_ = c10::value_or_else(cu_seqlens, [] { return at::Tensor(); });
-    const at::Tensor &chunk_indices_ = c10::value_or_else(chunk_indices, [] { return at::Tensor(); });
 
     // chunk_size默认值
     int64_t chunk_size_ = chunk_size.value_or(64);
@@ -167,20 +172,27 @@ at::Tensor npu_chunk_fwd_o(const at::Tensor & q, const at::Tensor & k, const at:
     EXEC_NPU_CMD_EXT(
         aclnnChunkFwdO,
         q, k, v, h, g,
-        cu_seqlens_, chunk_indices_, scale, chunk_size_,
+        cu_seqlens, chunk_indices, scale, chunk_size_,
         o
     );
     return o;
 }
 
-::std::tuple<at::Tensor,at::Tensor,at::Tensor> npu_chunk_gated_delta_rule_fwd_h(const at::Tensor & k, const at::Tensor & w, const at::Tensor & u, const at::Tensor & g, const c10::optional<at::Tensor> & initial_state, const c10::optional<at::Tensor> & cu_seqlens, const c10::optional<at::Tensor> & chunk_indices, c10::optional<bool> output_final_state, c10::optional<int64_t> chunk_size)
+::std::tuple<at::Tensor,at::Tensor,at::Tensor> npu_chunk_gated_delta_rule_fwd_h(
+    const at::Tensor & k, 
+    const at::Tensor & w, 
+    const at::Tensor & u, 
+    const at::Tensor & g, 
+    const c10::optional<at::Tensor> & initial_state, 
+    at::OptionalIntArrayRef cu_seqlens, 
+    at::OptionalIntArrayRef chunk_indices, 
+    c10::optional<bool> output_final_state, 
+    c10::optional<int64_t> chunk_size)
 {
     // optional 参数处理
     bool output_final_state_ = output_final_state.value_or(false);
     int64_t chunk_size_ = chunk_size.value_or(64);
     const at::Tensor &initial_state_ = c10::value_or_else(initial_state, [] { return at::Tensor(); });
-    const at::Tensor &cu_seqlens_ = c10::value_or_else(cu_seqlens, [] { return at::Tensor(); });
-    const at::Tensor &chunk_indices_ = c10::value_or_else(chunk_indices, [] { return at::Tensor(); });
 
     // 计算shape
     auto k_sizes = k.sizes();
@@ -193,7 +205,7 @@ at::Tensor npu_chunk_fwd_o(const at::Tensor & q, const at::Tensor & k, const at:
     int64_t NT = 0;
 
     if (cu_seqlens.has_value()) {
-        NT = cu_seqlens_.sizes()[0];
+        NT = cu_seqlens->size() - 1;
     } else {
         NT = (T + chunk_size_ - 1) / chunk_size_;
     }
@@ -215,7 +227,7 @@ at::Tensor npu_chunk_fwd_o(const at::Tensor & q, const at::Tensor & k, const at:
     EXEC_NPU_CMD_EXT(
         aclnnChunkGatedDeltaRuleFwdH,
         k, w, u, g,
-        initial_state_, cu_seqlens_, chunk_indices_,output_final_state_, chunk_size_,
+        initial_state_, cu_seqlens, chunk_indices, output_final_state_, chunk_size,
         h_out, v_new_out, final_state_out
     );
     return std::make_tuple(h_out, v_new_out, final_state_out);
