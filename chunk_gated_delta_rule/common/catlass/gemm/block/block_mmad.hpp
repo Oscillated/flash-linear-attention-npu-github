@@ -139,6 +139,7 @@ struct BlockMmadTla {
 #endif
 
 #include "catlass/gemm/block/block_mmad_pingpong_tla.hpp"
+#include "catlass/gemm/block/block_mmad_pingpong_tla_multi.hpp"
 #include "catlass/gemm/block/block_mmad_pingpong_dequant_tla.hpp"
 #include "catlass/gemm/block/block_mmad_pingpong_tla_v2.hpp"
 #include "catlass/gemm/block/block_mmad_preload_tla.hpp"

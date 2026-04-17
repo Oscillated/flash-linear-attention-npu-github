@@ -138,6 +138,39 @@ struct EpilogueAscend950Fixpipe {
     using ArchTag = Arch::Ascend950;
     static constexpr bool SPLIT_M = SPLIT_M_;
 };
+
+struct EpilogueAtlasGDNFwdHVnew {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using ArchTag = Arch::Ascend950;
+#else
+    using ArchTag = Arch::AtlasA2;
+#endif
+};
+
+struct EpilogueAtlasGDNFwdHUpdate {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using ArchTag = Arch::Ascend950;
+#else
+    using ArchTag = Arch::AtlasA2;
+#endif
+};
+
+struct EpilogueAtlasGDNFwdOQkmask {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using ArchTag = Arch::Ascend950;
+#else
+    using ArchTag = Arch::AtlasA2;
+#endif
+};
+
+struct EpilogueAtlasGDNFwdOOutput {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using ArchTag = Arch::Ascend950;
+#else
+    using ArchTag = Arch::AtlasA2;
+#endif
+};
+ 	 
 }  // namespace Catlass::Epilogue
 
 #endif  // CATLASS_EPILOGUE_DISPATCH_POLICY_HPP
