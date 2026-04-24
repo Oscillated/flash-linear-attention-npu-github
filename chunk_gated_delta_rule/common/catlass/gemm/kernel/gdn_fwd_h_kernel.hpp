@@ -149,6 +149,7 @@ public:
     uint32_t vWorkspaceOffset;
     uint32_t vUpdateWorkspaceOffset;
     uint32_t hWorkspaceOffset;
+    uint32_t numSeqWorkspaceOffset;
     uint32_t numChunksWorkspaceOffset;
     
     AscendC::GlobalTensor<ElementK> gmK;
@@ -164,6 +165,7 @@ public:
     AscendC::GlobalTensor<ElementHWork> gmHWorkspace;
     
     AscendC::GlobalTensor<int64_t> gmSeqlen;
+    AscendC::GlobalTensor<int64_t> gmNumSeq;
     AscendC::GlobalTensor<int64_t> gmNumChunks;
 
     CubeScheduler cubeBlockScheduler;
@@ -194,6 +196,7 @@ public:
         vWorkspaceOffset = gdnFwdHTilingData->vWorkspaceOffset;
         vUpdateWorkspaceOffset = gdnFwdHTilingData->vUpdateWorkspaceOffset;
         hWorkspaceOffset = gdnFwdHTilingData->hWorkspaceOffset;
+        numSeqWorkspaceOffset = gdnFwdHTilingData->numSeqWorkspaceOffset;
         numChunksWorkspaceOffset = gdnFwdHTilingData->numChunksWorkspaceOffset;
         
         gmK.SetGlobalBuffer((__gm__ ElementK *)k);
@@ -209,6 +212,7 @@ public:
         gmHWorkspace.SetGlobalBuffer((__gm__ ElementHWork *)(user + hWorkspaceOffset));
 
         gmSeqlen.SetGlobalBuffer((__gm__ int64_t *)cu_seqlens);
+        gmNumSeq.SetGlobalBuffer((__gm__ int64_t *)(user + numSeqWorkspaceOffset));
         gmNumChunks.SetGlobalBuffer((__gm__ int64_t *)(user + numChunksWorkspaceOffset));
 
         if ASCEND_IS_AIC {
@@ -305,7 +309,7 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
                 for (uint32_t shapeBatchIdx = 0; shapeBatchIdx < shapeBatch; shapeBatchIdx++) {
                     for (uint32_t vHeadIdx = 0; vHeadIdx < vNumHead; vHeadIdx++) {
-                        for (uint32_t tokenBatchIdx = 0; tokenBatchIdx < tokenBatch; tokenBatchIdx++) {
+                        for (uint32_t tokenBatchIdx = 0; tokenBatchIdx < vecBlockScheduler.tokenBatch; tokenBatchIdx++) {
                             uint32_t batchIdx = isVariedLen ? tokenBatchIdx : shapeBatchIdx;
                             uint32_t chunkOffset = isVariedLen ? gmNumChunks.GetValue(tokenBatchIdx) : 0;
                             uint32_t initialStateOffset = (batchIdx * vNumHead + vHeadIdx) * stateBlockSize;

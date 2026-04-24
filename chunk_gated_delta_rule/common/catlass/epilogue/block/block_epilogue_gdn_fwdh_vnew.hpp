@@ -220,6 +220,10 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
         AscendC::DataCopy(vnewdecayOutputThisSubBlock, vNewDecayUbTensor, mActualThisSubBlock * nvActual);
 
+        if (isFirst) {
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+
         isFirst = false;
     }
 

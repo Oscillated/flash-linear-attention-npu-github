@@ -60,6 +60,7 @@ struct BlockSchedulerGdnFwdH {
     uint32_t tokenBatch;
     bool useInitialState;
     bool storeFinalState;
+    uint32_t numSeqWorkspaceOffset;
     uint32_t numChunksWorkspaceOffset;
 
     uint32_t taskIdx;
@@ -98,6 +99,7 @@ struct BlockSchedulerGdnFwdH {
     uint32_t batchTokens;
 
     AscendC::GlobalTensor<int64_t> gmSeqlen;
+    AscendC::GlobalTensor<int64_t> gmNumSeq;
     AscendC::GlobalTensor<int64_t> gmNumChunks;
 
     Arch::CrossCoreFlag cube1Done{0};
@@ -124,10 +126,37 @@ struct BlockSchedulerGdnFwdH {
         tokenBatch = gdnFwdHTilingData->tokenBatch;
         useInitialState = gdnFwdHTilingData->useInitialState;
         storeFinalState = gdnFwdHTilingData->storeFinalState;
+        numSeqWorkspaceOffset = gdnFwdHTilingData->numSeqWorkspaceOffset;
         numChunksWorkspaceOffset = gdnFwdHTilingData->numChunksWorkspaceOffset;
 
         gmSeqlen.SetGlobalBuffer((__gm__ int64_t *)cu_seqlens);
+        gmNumSeq.SetGlobalBuffer((__gm__ int64_t *)(user + numSeqWorkspaceOffset));
         gmNumChunks.SetGlobalBuffer((__gm__ int64_t *)(user + numChunksWorkspaceOffset));
+
+        if (isVariedLen) {
+            gmNumChunks.SetValue(0, 0);
+            gmNumSeq.SetValue(0, 0);
+            uint32_t actualBatch = 0;
+            int64_t prevSeq = 0, currSeq;
+            for (uint32_t b = 1; b <= tokenBatch; b++) {
+                currSeq = gmSeqlen.GetValue(b);
+                int64_t batchSeqLen = currSeq - prevSeq;
+                if (batchSeqLen > 0) {
+                    actualBatch++;
+                    gmNumSeq.SetValue(actualBatch, currSeq);
+                    int64_t batchChunk = (batchSeqLen + chunkSize - 1) / chunkSize;
+                    gmNumChunks.SetValue(actualBatch, gmNumChunks.GetValue(actualBatch - 1) + batchChunk);
+                }
+                prevSeq = currSeq;
+            }
+            tokenBatch = actualBatch;
+            batch = actualBatch;
+            totalChunks = gmNumChunks.GetValue(tokenBatch);
+            totalTokens = gmNumSeq.GetValue(tokenBatch);
+        } else {
+            totalChunks = (seqlen + chunkSize - 1) / chunkSize;
+            totalTokens = seqlen;
+        }
 
         cubeCoreIdx = coreIdx;
         cubeCoreNum = coreNum;
@@ -140,19 +169,6 @@ struct BlockSchedulerGdnFwdH {
         taskIdx = cubeCoreIdx * headInnerLoop;
         isRunning = taskIdx < taskNum;
 
-        if (isVariedLen) {
-            gmNumChunks.SetValue(0, 0);
-            for (uint32_t b = 1; b <= tokenBatch; b++) {
-                int64_t batchChunk = (gmSeqlen.GetValue(b) - gmSeqlen.GetValue(b - 1) + chunkSize - 1) / chunkSize;
-                gmNumChunks.SetValue(b, gmNumChunks.GetValue(b - 1) + batchChunk);
-            }
-            totalChunks = gmNumChunks.GetValue(tokenBatch);
-            totalTokens = gmSeqlen.GetValue(tokenBatch);
-        } else {
-            totalChunks = (seqlen + chunkSize - 1) / chunkSize;
-            totalTokens = seqlen;
-        }
-        
     }
 
     CATLASS_DEVICE
@@ -172,8 +188,8 @@ struct BlockSchedulerGdnFwdH {
             tokenBatchIdx = isVariedLen ? batchIdx : 0;
             chunkOffset = isVariedLen ? gmNumChunks.GetValue(tokenBatchIdx) : 0;
             batchChunks = isVariedLen ? (gmNumChunks.GetValue(tokenBatchIdx + 1) - chunkOffset) : totalChunks;
-            tokenOffset = isVariedLen ? gmSeqlen.GetValue(tokenBatchIdx) : 0;
-            batchTokens = isVariedLen ? (gmSeqlen.GetValue(tokenBatchIdx + 1) - tokenOffset) : totalTokens;
+            tokenOffset = isVariedLen ? gmNumSeq.GetValue(tokenBatchIdx) : 0;
+            batchTokens = isVariedLen ? (gmNumSeq.GetValue(tokenBatchIdx + 1) - tokenOffset) : totalTokens;
             chunkIdx = 0;
             headInnerIdx = 0;
         } else {
