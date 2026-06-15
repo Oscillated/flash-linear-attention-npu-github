@@ -1,15 +1,11 @@
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * the BSD 3-Clause License (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * Licensed under the BSD 3-Clause License.
  */
 
 /*!
  * \file solve_tril_tiling.cpp
- * \brief Tiling computation for SolveTril operator (MCH_ONLY branch)
+ * \brief Tiling for SolveTril: input [B,S,H,BT] or [T,H,BT], BT in {16,32,64,128}
  */
 
 #include "solve_tril_tiling.h"
@@ -38,91 +34,97 @@ static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, int64_t* co
 
 static ge::graphStatus SolveTrilTilingFunc(gert::TilingContext* context)
 {
-    // 1. Get platform info
+    // 1. Platform info
     int64_t coreNum;
-    OP_CHECK_IF(
-        GetPlatformInfo(context, &coreNum) != ge::GRAPH_SUCCESS,
-        OP_LOGE(context, "GetPlatformInfo error"),
-        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(GetPlatformInfo(context, &coreNum) != ge::GRAPH_SUCCESS,
+                OP_LOGE(context, "GetPlatformInfo error"), return ge::GRAPH_FAILED);
 
-    // 2. Get input shape
+    // 2. Parse input shape
     auto inputShape = context->GetInputShape(0);
     OP_CHECK_NULL_WITH_CONTEXT(context, inputShape);
     auto shape = inputShape->GetStorageShape();
     int64_t dimNum = shape.GetDimNum();
 
-    // Determine batch and matrix dimension
-    int64_t batchSize = 1;
-    int64_t n = 0;
-    if (dimNum == 2) {
-        n = shape.GetDim(0);
+    int64_t B, S, H, BT;
+    if (dimNum == 4) {
+        // BSND: [B, S, H, BT]
+        B  = shape.GetDim(0);
+        S  = shape.GetDim(1);
+        H  = shape.GetDim(2);
+        BT = shape.GetDim(3);
     } else if (dimNum == 3) {
-        batchSize = shape.GetDim(0);
-        n = shape.GetDim(1);
+        // TND: [T, H, BT]
+        B  = 1;
+        S  = shape.GetDim(0);
+        H  = shape.GetDim(1);
+        BT = shape.GetDim(2);
     } else {
-        OP_LOGE(context, "SolveTril: unsupported rank %ld, expected 2 or 3", dimNum);
+        OP_LOGE(context, "SolveTril: unsupported rank %ld, expected 3 or 4", dimNum);
         return ge::GRAPH_FAILED;
     }
 
-    // Validate n is multiple of LEAF_BLOCK_SIZE and supported
-    if (n == 0 || n % LEAF_BLOCK_SIZE != 0) {
-        OP_LOGE(context, "SolveTril: n=%ld must be positive multiple of %u", n, LEAF_BLOCK_SIZE);
-        return ge::GRAPH_FAILED;
-    }
-    if (n != 16 && n != 32 && n != 64 && n != 128) {
-        OP_LOGE(context, "SolveTril: n=%ld not supported, must be 16/32/64/128", n);
+    // 3. Validate BT
+    if (BT != 16 && BT != 32 && BT != 64 && BT != 128) {
+        OP_LOGE(context, "SolveTril: BT=%ld not in {16,32,64,128}", BT);
         return ge::GRAPH_FAILED;
     }
 
-    // Get input dtype
-    auto inputDtype = context->GetInputDesc(0)->GetDataType();
-
-    int64_t numLeafBlocks = n / LEAF_BLOCK_SIZE;
+    // 4. Derived values
+    int64_t NT = CeilDiv(S, BT);
+    int64_t numLeafBlocks = BT / LEAF_BLOCK_SIZE;
     int64_t mbhLevels = 0;
-    if (n == 32) {
-        mbhLevels = 1;
-    } else if (n == 64) {
-        mbhLevels = 2;
-    } else if (n == 128) {
-        mbhLevels = 3;
+    if (BT == 32)      mbhLevels = 1;
+    else if (BT == 64) mbhLevels = 2;
+    else if (BT == 128)mbhLevels = 3;
+
+    // 5. Detect varlen
+    int64_t isVarlen = 0;
+    auto cuSeqlensShape = context->GetOptionalInputShape(1);
+    if (cuSeqlensShape != nullptr) isVarlen = 1;
+
+    // 6. Total tasks
+    int64_t totalTasks;
+    if (isVarlen) {
+        auto chunkIndicesShape = context->GetOptionalInputShape(2);
+        if (chunkIndicesShape == nullptr) {
+            OP_LOGE(context, "SolveTril: varlen requires chunk_indices_out");
+            return ge::GRAPH_FAILED;
+        }
+        totalTasks = chunkIndicesShape->GetStorageShape().GetDim(0);
+    } else {
+        totalTasks = B * H * NT;
     }
 
-    // 3. Multi-core split
-    int64_t totalTasks;
-    if (mbhLevels == 0) {
-        totalTasks = batchSize * numLeafBlocks;
-    } else {
-        totalTasks = batchSize;
-    }
+    // 7. Multi-core split
     int64_t usedCoreNum = totalTasks < coreNum ? totalTasks : coreNum;
     if (usedCoreNum == 0) usedCoreNum = 1;
     int64_t taskPerCore = CeilDiv(totalTasks, usedCoreNum);
 
-    // 4. Set workspace
+    // 8. Workspace
     size_t* currentWorkspace = context->GetWorkspaceSizes(WORKSPACE_NUM);
     OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
     size_t wsSize = WS_SYS_SIZE;
     if (mbhLevels >= 2) {
-        size_t mainSize = static_cast<size_t>(n) * n * sizeof(float);
-        wsSize = static_cast<size_t>(batchSize) * mainSize;
+        wsSize = static_cast<size_t>(totalTasks) * static_cast<size_t>(BT) * BT * sizeof(float);
     }
     currentWorkspace[0] = wsSize;
 
-    // 5. Fill TilingData
+    // 9. Fill TilingData
     SolveTrilTilingData* tiling = context->GetTilingData<SolveTrilTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-    tiling->n = n;
-    tiling->batchSize = batchSize;
-    tiling->numLeafBlocks = numLeafBlocks;
+    tiling->n = BT;
+    tiling->totalTasks = totalTasks;
+    tiling->H = H;
+    tiling->NT = NT;
+    tiling->rowStride = H * BT;
     tiling->mbhLevels = mbhLevels;
     tiling->blockDim = usedCoreNum;
     tiling->taskPerCore = taskPerCore;
-    tiling->workspaceOffset = 0LL;
-    tiling->reserved = 0LL;
 
     context->SetBlockDim(static_cast<uint32_t>(usedCoreNum));
 
-    // 6. Set TilingKey: D_TYPE + MBH_LEVELS
+    // 10. TilingKey
+    auto inputDtype = context->GetInputDesc(0)->GetDataType();
     uint32_t dType = static_cast<uint32_t>(inputDtype);
     ASCENDC_TPL_SEL_PARAM(context, dType, static_cast<uint32_t>(mbhLevels));
 

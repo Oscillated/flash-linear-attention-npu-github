@@ -5,7 +5,9 @@
 
 /*!
  * \file solve_tril_def.cpp
- * \brief SolveTril operator definition: input/output declaration and platform registration
+ * \brief SolveTril operator definition
+ *
+ * Solves (I + A)^{-1} per chunk. Input A: [B, S, H, BT], dtype FLOAT16.
  */
 
 #include "register/op_def_registry.h"
@@ -15,18 +17,33 @@ class SolveTril : public OpDef {
 public:
     explicit SolveTril(const char* name) : OpDef(name)
     {
-        this->Input("x")
+        this->Input("A")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Output("y")
+        this->Input("cu_seqlens")
+            .ParamType(OPTIONAL)
+            .ValueDepend(OPTIONAL)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("chunk_indices_out")
+            .ParamType(OPTIONAL)
+            .ValueDepend(OPTIONAL)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Output("out")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND})
             .AutoContiguous();
+        this->Attr("layout").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)
