@@ -1,102 +1,261 @@
+"""
+test_npu_solve_tril.py - Test SolveTril custom operator via torch.ops.npu
+Supports BHTD [B,H,T,BT], BSND [B,T,H,BT], and TND [total_T,H,BT] layouts.
+"""
 import torch
 import torch_npu
 import numpy as np
 import fla_npu
 
-torch.npu.utils.set_device(1)
-torch.npu.config.allow_internal_format = False
-torch.npu.set_compile_mode(jit_compile=False)
+torch.npu.utils.set_device(0)
 
 
-def make_input(B, S, H, BT, dtype=torch.float16):
-    """Construct unit lower-triangular input [B, S, H, BT]."""
-    A = torch.zeros(B, S, H, BT, dtype=dtype)
-    NT = (S + BT - 1) // BT
+def solve_tril_golden(A_tensor, chunk_size, layout="bhtd"):
+    """CPU golden: compute (I + A)^{-1} for each chunk, support non-aligned T."""
+    A = A_tensor.float().numpy()
+    if layout == "bhtd":
+        B, H, T, BT = A.shape
+    else:
+        B, T, H, BT = A.shape
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    result = np.zeros_like(A)
+
     for b in range(B):
         for h in range(H):
-            for c in range(NT):
-                s_start = c * BT
-                s_end = min(s_start + BT, S)
-                eff = s_end - s_start
-                for i in range(eff):
-                    A[b, s_start + i, h, i] = 1.0
-                    for j in range(i):
-                        A[b, s_start + i, h, j] = torch.randn(1, dtype=torch.float32).item() * 0.3
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                if layout == "bhtd":
+                    block = A[b, h, s:e, :actual_size]
+                else:
+                    block = A[b, s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                M = eye + block
+                M_inv = np.linalg.inv(M)
+                if layout == "bhtd":
+                    result[b, h, s:e, :actual_size] = M_inv
+                else:
+                    result[b, s:e, h, :actual_size] = M_inv
+    return torch.from_numpy(result).half()
+
+
+def generate_lower_tri_input(B, H, T, chunk_size, dtype=torch.float16, seed=42, layout="bhtd"):
+    """Generate random strictly lower triangular input."""
+    torch.manual_seed(seed)
+    if layout == "bhtd":
+        A = torch.zeros(B, H, T, chunk_size, dtype=dtype)
+    else:
+        A = torch.zeros(B, T, H, chunk_size, dtype=dtype)
+    num_chunks = (T + chunk_size - 1) // chunk_size
+
+    for b in range(B):
+        for h in range(H):
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                one_chunk = torch.randn(actual_size, actual_size, dtype=dtype) * 0.1
+                for i in range(actual_size):
+                    for j in range(i, actual_size):
+                        one_chunk[i, j] = 0.0
+                if layout == "bhtd":
+                    A[b, h, s:e, :actual_size] = one_chunk
+                else:
+                    A[b, s:e, h, :actual_size] = one_chunk
     return A
 
 
-def solve_tril_ref(A):
-    """Reference: torch.inverse per chunk."""
-    B, S, H, BT = A.shape
-    NT = (S + BT - 1) // BT
-    out = torch.zeros_like(A)
+def test_solve_tril(B, H, T, chunk_size, layout="bhtd", dtype=torch.float16):
+    """Run one test case."""
+    torch.manual_seed(42)
+    A = generate_lower_tri_input(B, H, T, chunk_size, dtype, layout=layout)
+    golden = solve_tril_golden(A, chunk_size, layout=layout)
+
+    A_npu = A.npu()
+    out_npu = torch.ops.npu.npu_solve_tril(A_npu, chunk_size, layout=layout)
+    out_cpu = out_npu.cpu()
+
+    num_chunks = (T + chunk_size - 1) // chunk_size
+
+    diff = (out_cpu.float() - golden.float()).abs()
+    max_diff = diff.max().item()
+
+    A_np = A.float().numpy()
+    R_np = out_cpu.float().numpy()
+    max_verify_err = 0.0
+    print(f"\n--- Test (layout={layout}, B={B}, H={H}, T={T}, BT={chunk_size}, numChunks={num_chunks}) ---")
     for b in range(B):
         for h in range(H):
-            for c in range(NT):
-                s_start = c * BT
-                s_end = min(s_start + BT, S)
-                eff = s_end - s_start
-                if eff < BT:
-                    block = torch.eye(BT, dtype=A.dtype, device=A.device)
-                    block[:eff, :eff] = A[b, s_start:s_end, h, :eff]
-                    inv = torch.inverse(block.to(torch.float32)).to(A.dtype)
-                    out[b, s_start:s_end, h, :eff] = inv[:eff, :eff]
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                if layout == "bhtd":
+                    block = A_np[b, h, s:e, :actual_size]
+                    inv_block = R_np[b, h, s:e, :actual_size]
                 else:
-                    block = A[b, s_start:s_end, h, :BT]
-                    inv = torch.inverse(block.to(torch.float32)).to(A.dtype)
-                    out[b, s_start:s_end, h, :BT] = inv
-    return out
+                    block = A_np[b, s:e, h, :actual_size]
+                    inv_block = R_np[b, s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                product = (eye + block) @ inv_block
+                err = np.abs(product - eye).max()
+                max_verify_err = max(max_verify_err, err)
 
+                golden_chunk = golden[b, h, s:e, :actual_size].float().numpy() if layout == "bhtd" else golden[b, s:e, h, :actual_size].float().numpy()
+                chunk_diff = np.abs(inv_block - golden_chunk).max()
+                is_partial = (c == num_chunks - 1 and actual_size < chunk_size)
+                partial_tag = f" [partial {actual_size}x{actual_size}]" if is_partial else ""
+                cst = "OK" if err < 1e-3 else "FAIL"
+                print(f"  [{cst}] b={b} h={h} c={c}{partial_tag}: max_diff={chunk_diff:.6f}, verify_err={err:.6f}")
 
-def compute_mere(actual, golden):
-    diff = torch.abs(actual.float() - golden.float())
-    denom = torch.clamp(torch.abs(golden.float()), min=1e-10)
-    return (diff / denom).max().item()
-
-
-def test_case(B, S, H, BT, name):
-    torch.manual_seed(42)
-    A = make_input(B, S, H, BT, torch.float16)
-    A_npu = A.contiguous().npu()
-    torch.npu.synchronize()
-
-    for _ in range(5):
-        result_npu = torch.ops.npu.npu_solve_tril(A_npu)
-        torch.npu.synchronize()
-
-    golden = solve_tril_ref(A)
-    mere = compute_mere(result_npu.cpu(), golden)
-    threshold = 9.77e-04  # fp16 spec standard
-    passed = mere < threshold
+    passed = max_verify_err < 1e-3
     status = "PASS" if passed else "FAIL"
-    print(f"[{status}] {name}: B={B},S={S},H={H},BT={BT}, MERE={mere:.6e}")
+    print(f"  [{status}] layout={layout} B={B} H={H} T={T} BT={chunk_size}: "
+          f"max_diff={max_diff:.6f}, verify_err={max_verify_err:.6f}")
+    return passed
+
+
+def test_solve_tril_varlen(seq_lens, H, chunk_size, dtype=torch.float16):
+    """Test THD varlen format [total_T, H, BT]."""
+    total_T = sum(seq_lens)
+    cu_seqlens = torch.tensor([0] + list(np.cumsum(seq_lens)), dtype=torch.int32)
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    num_chunks_per_seq = (lens + chunk_size - 1) // chunk_size
+
+    all_seq_ids = []
+    all_chunk_ids = []
+    for seq_idx, n_chunks in enumerate(num_chunks_per_seq):
+        n = n_chunks.item()
+        all_seq_ids.extend([seq_idx] * n)
+        all_chunk_ids.extend(range(n))
+    chunk_indices = torch.stack([
+        torch.tensor(all_seq_ids, dtype=torch.int32),
+        torch.tensor(all_chunk_ids, dtype=torch.int32)
+    ], dim=1)
+
+    torch.manual_seed(42)
+    A = torch.zeros(total_T, H, chunk_size, dtype=dtype)
+    num_seqs = len(seq_lens)
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                one_chunk = torch.randn(actual_size, actual_size, dtype=dtype) * 0.1
+                for i in range(actual_size):
+                    for j in range(i, actual_size):
+                        one_chunk[i, j] = 0.0
+                A[s:e, h, :actual_size] = one_chunk
+
+    A_np = A.float().numpy()
+    golden = np.zeros_like(A_np)
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                block = A_np[s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                M = eye + block
+                M_inv = np.linalg.inv(M)
+                golden[s:e, h, :actual_size] = M_inv
+    golden = torch.from_numpy(golden).half()
+
+    A_npu = A.npu()
+    cu_seqlens_list = cu_seqlens.tolist()
+    chunk_indices_flat = chunk_indices.flatten().tolist()
+
+    out_npu = torch.ops.npu.npu_solve_tril(A_npu, chunk_size,
+                                           cu_seqlens=cu_seqlens_list,
+                                           chunk_indices=chunk_indices_flat,
+                                           layout="tnd")
+    out_cpu = out_npu.cpu()
+
+    max_verify_err = 0.0
+    total_chunks = chunk_indices.shape[0]
+    print(f"\n--- Varlen test (seqs={seq_lens}, H={H}, BT={chunk_size}, "
+          f"total_T={total_T}, total_chunks={total_chunks}) ---")
+
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                block = A_np[s:e, h, :actual_size]
+                inv_block = out_cpu[s:e, h, :actual_size].float().numpy()
+                eye = np.eye(actual_size, dtype=np.float32)
+                product = (eye + block) @ inv_block
+                err = np.abs(product - eye).max()
+                max_verify_err = max(max_verify_err, err)
+
+                golden_chunk = golden[s:e, h, :actual_size].float().numpy()
+                chunk_diff = np.abs(inv_block - golden_chunk).max()
+                is_partial = (actual_size < chunk_size)
+                partial_tag = f" [partial {actual_size}x{actual_size}]" if is_partial else ""
+                cst = "OK" if err < 1e-3 else "FAIL"
+                print(f"  [{cst}] seq={seq_idx} h={h} c={c}{partial_tag}: "
+                      f"max_diff={chunk_diff:.6f}, verify_err={err:.6f}")
+
+    passed = max_verify_err < 1e-3
+    status = "PASS" if passed else "FAIL"
+    print(f"  [{status}] varlen seqs={seq_lens}, H={H}, BT={chunk_size}: "
+          f"max_verify_err={max_verify_err:.6f}")
     return passed
 
 
 if __name__ == "__main__":
-    print("Warming up kernel variants...")
-    for BT in [16, 32, 64]:
-        A_warmup = make_input(1, BT, 1, BT, torch.float16).contiguous().npu()
-        for _ in range(5):
-            _ = torch.ops.npu.npu_solve_tril(A_warmup)
-            torch.npu.synchronize()
-        del A_warmup
-    torch.npu.synchronize()
-    print("Warmup complete.\n")
+    print("=" * 60)
+    print("SolveTril NPU Test (torch.ops.npu)")
+    print("=" * 60)
 
     results = []
-    results.append(test_case(1, 16, 1, 16, "L0-01 BT=16"))
-    results.append(test_case(1, 32, 1, 32, "L0-02 BT=32"))
-    results.append(test_case(1, 64, 1, 64, "L0-03 BT=64"))
-    # bug
-    # results.append(test_case(1, 128, 1, 128, "L0-04 BT=128"))
-    results.append(test_case(1, 64, 2, 64, "L1-01 H=2"))
-    results.append(test_case(2, 64, 4, 64, "L1-02 B=2,H=4"))
-    results.append(test_case(1, 128, 1, 64, "L1-03 NT=2"))
-    results.append(test_case(1, 100, 1, 64, "L1-04 S=100 tail"))
 
-    passed = sum(results)
-    total = len(results)
-    print(f"\nTotal: {total}, Passed: {passed}, Failed: {total - passed}")
-    if passed < total:
+    # BHTD layout tests
+    print("\n--- BHTD layout [B, H, T, BT] ---")
+    results.append(test_solve_tril(1, 1, 16, 16, layout="bhtd"))
+    results.append(test_solve_tril(2, 2, 32, 32, layout="bhtd"))
+    results.append(test_solve_tril(1, 1, 64, 32, layout="bhtd"))
+    results.append(test_solve_tril(1, 1, 100, 32, layout="bhtd"))
+    results.append(test_solve_tril(1, 1, 50, 32, layout="bhtd"))
+    results.append(test_solve_tril(2, 2, 100, 32, layout="bhtd"))
+
+    # BSND layout tests
+    print("\n--- BSND layout [B, T, H, BT] ---")
+    results.append(test_solve_tril(1, 2, 64, 32, layout="bsnd"))
+    results.append(test_solve_tril(2, 2, 64, 32, layout="bsnd"))
+    results.append(test_solve_tril(1, 1, 35, 32, layout="bsnd"))
+    results.append(test_solve_tril(2, 2, 100, 32, layout="bsnd"))
+
+    # Varlen TND tests
+    print("\n--- TND varlen layout [total_T, H, BT] ---")
+    results.append(test_solve_tril_varlen([64], 1, 32))
+    results.append(test_solve_tril_varlen([32, 32, 32], 2, 32))
+    results.append(test_solve_tril_varlen([100, 50, 35], 2, 32))
+    results.append(test_solve_tril_varlen([35], 1, 32))
+    results.append(test_solve_tril_varlen([3], 1, 32))
+    results.append(test_solve_tril_varlen([18], 2, 32))
+
+    print(f"\n{'='*60}")
+    print(f"Results: {sum(results)}/{len(results)} passed")
+    if all(results):
+        print("All tests PASSED!")
+        exit(0)
+    else:
+        print("Some tests FAILED!")
         exit(1)

@@ -8,18 +8,14 @@
 
 add_op_to_compiled_list()
 
-if (BUILD_OPEN_PROJECT)
-    target_sources(op_host_aclnn PRIVATE
-        solve_tril_def.cpp
-    )
-    target_compile_definitions(op_host_aclnn PRIVATE
-        ASCEND_SOC_VERSION="${ASCEND_COMPUTE_UNIT}"
-    )
-    add_ops_compile_options(
-        OP_NAME SolveTril
-        OPTIONS --cce-auto-sync=off
-                -Wno-deprecated-declarations
+if(BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnnExc PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/solve_tril_def.cpp
     )
 endif()
 
-add_modules_sources(OPTYPE solve_tril ACLNNTYPE aclnn)
+add_modules_sources(OPTYPE solve_tril ACLNNTYPE aclnn_exclude)
+
+add_ops_compile_options(OP_NAME SolveTril OPTIONS
+    --cce-auto-sync=off
+)

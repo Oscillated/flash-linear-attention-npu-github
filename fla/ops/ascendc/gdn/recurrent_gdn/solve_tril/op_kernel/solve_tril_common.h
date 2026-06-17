@@ -3,54 +3,30 @@
  * Licensed under the BSD 3-Clause License.
  */
 
-#ifndef __SOLVE_TRIL_COMMON_H__
-#define __SOLVE_TRIL_COMMON_H__
+#ifndef SOLVE_TRIL_COMMON_H
+#define SOLVE_TRIL_COMMON_H
 
-#include "ascendc/host_api/tiling/template_argument.h"
-#include "solve_tril_tiling_data.h"
+#include "kernel_operator.h"
 
-// ============================================================================
-// Constants
-// ============================================================================
-constexpr uint32_t LEAF_BLOCK_SIZE = 16;
-constexpr uint32_t MCH_ITERATIONS = 3;
-constexpr uint32_t LEAF_ELEMENTS = LEAF_BLOCK_SIZE * LEAF_BLOCK_SIZE;
+// AIC/AIV 同步标志常量
+constexpr uint64_t SYNC_AIV_AIC_FLAG_SOLVE = 3;
+constexpr uint64_t SYNC_AIC_AIV_FLAG_SOLVE = 5;
 
-constexpr uint32_t MCH_WORK_SLOTS = 5;
-constexpr uint32_t MCH_ONLY_WORK_ELEMENTS = MCH_WORK_SLOTS * LEAF_ELEMENTS;
-constexpr uint32_t MCH_ONLY_WORK_BYTES = MCH_ONLY_WORK_ELEMENTS * sizeof(float);
+// GM 共享 workspace slot（ND 行优先）
+constexpr int32_t GM_WS_I    = 0;
+constexpr int32_t GM_WS_INEG = 1;
+constexpr int32_t GM_WS_ZERO = 2;
+constexpr int32_t GM_NUM_SHARED_SLOTS = 3;
 
-constexpr uint32_t MBH1_WORK_SLOTS = 10;
-constexpr uint32_t MBH1_WORK_ELEMENTS = MBH1_WORK_SLOTS * LEAF_ELEMENTS;
-constexpr uint32_t MBH1_WORK_BYTES = MBH1_WORK_ELEMENTS * sizeof(float);
+// AIV 核生成辅助矩阵的参数
+constexpr int32_t ROWS_PER_AIV_CORE = 8;
+constexpr int32_t DIAG_BLOCK_ELEMS  = ROWS_PER_AIV_CORE * 16;  // 8x16
 
-constexpr uint32_t MBH2_RESULT_DIM = 64;
-constexpr uint32_t MBH2_RESULT_SIZE = MBH2_RESULT_DIM * MBH2_RESULT_DIM;
-constexpr uint32_t MBH2_WORK_TOTAL = MBH2_RESULT_SIZE + MCH_WORK_SLOTS * LEAF_ELEMENTS;
-constexpr uint32_t MBH2_WORK_BYTES = MBH2_WORK_TOTAL * sizeof(float);
+// 8x16 ND 块中对角 mask（偶数条带）
+// 对角在 col 0..7: elem = i*16 + i
+constexpr uint64_t DIAG_MASK_8X16_EVEN[2] = {
+    0x0008000400020001ULL,
+    0x0080004000200010ULL
+};
 
-constexpr uint32_t MBH3_RESULT_DIM = 128;
-constexpr uint32_t MBH3_RESULT_SIZE = MBH3_RESULT_DIM * MBH3_RESULT_DIM;
-constexpr uint32_t MBH3_WORK_TOTAL = MBH3_RESULT_SIZE + MCH_WORK_SLOTS * LEAF_ELEMENTS;
-constexpr uint32_t MBH3_WORK_BYTES = MBH3_WORK_TOTAL * sizeof(float);
-
-constexpr uint32_t UB_CAPACITY_BYTES = 192 * 1024;
-
-// ============================================================================
-// TilingKey: D_TYPE (FLOAT16) x MBH_LEVELS (0,1,2,3)
-// Note: BF16 kernel support requires ascend950 (bisheng for ascend910b
-//       does not support bf16 type cast in backend).
-// ============================================================================
-ASCENDC_TPL_ARGS_DECL(SolveTril,
-    ASCENDC_TPL_DATATYPE_DECL(D_TYPE, C_DT_FLOAT16, ASCENDC_TPL_INPUT(0)),
-    ASCENDC_TPL_UINT_DECL(MBH_LEVELS, 8, ASCENDC_TPL_UI_LIST, 0, 1, 2, 3)
-);
-
-ASCENDC_TPL_SEL(
-    ASCENDC_TPL_ARGS_SEL(
-        ASCENDC_TPL_DATATYPE_SEL(D_TYPE, C_DT_FLOAT16),
-        ASCENDC_TPL_UINT_SEL(MBH_LEVELS, ASCENDC_TPL_UI_LIST, 0, 1, 2, 3)
-    ),
-);
-
-#endif // __SOLVE_TRIL_COMMON_H__
+#endif  // SOLVE_TRIL_COMMON_H

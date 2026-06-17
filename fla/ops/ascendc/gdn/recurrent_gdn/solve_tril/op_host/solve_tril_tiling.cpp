@@ -3,155 +3,131 @@
  * Licensed under the BSD 3-Clause License.
  */
 
-/*!
- * \file solve_tril_tiling.cpp
- * \brief Tiling for SolveTril.
- *
- * Layout modes:
- *   - BSND (mode=0): input [B, S, H, BT], fixed-length sequences
- *   - TND  (mode=1): input [T, H, BT] (B=1, S=T), varlen via cu_seqlens + chunk_indices_out
- */
-
 #include "solve_tril_tiling.h"
-#include "register/op_def_registry.h"
-#include "op_common/log/log.h"
-#include "op_common/op_host/util/math_util.h"
-#include "op_common/op_host/util/platform_util.h"
-#include "../op_kernel/solve_tril_common.h"
+#include "register/op_impl_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include <string>
 
 namespace optiling {
 
-using Ops::Base::CeilDiv;
-
-constexpr size_t WORKSPACE_NUM = 1;
-constexpr uint32_t WS_SYS_SIZE = 0U;
-constexpr int32_t MODE_BSND = 0;
-constexpr int32_t MODE_TND  = 1;
-
-static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, int64_t* coreNum)
-{
-    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
-    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
-    *coreNum = ascendcPlatform.GetCoreNumAiv();
-    OP_CHECK_IF(*coreNum == 0, OP_LOGE(context, "coreNum is 0"), return ge::GRAPH_FAILED);
-    return ge::GRAPH_SUCCESS;
-}
+constexpr uint32_t INPUT_X_IDX = 0;
+constexpr uint32_t INPUT_CU_SEQLENS_IDX = 1;
+constexpr uint32_t INPUT_CHUNK_INDICES_IDX = 2;
+constexpr uint32_t OUTPUT_X_OUT_IDX = 0;
+constexpr uint32_t ATTR_CHUNK_SIZE_IDX = 0;
+constexpr uint32_t ATTR_LAYOUT_IDX = 1;
 
 static ge::graphStatus SolveTrilTilingFunc(gert::TilingContext* context)
 {
-    // 1. Platform info
-    int64_t coreNum;
-    OP_CHECK_IF(GetPlatformInfo(context, &coreNum) != ge::GRAPH_SUCCESS,
-                OP_LOGE(context, "GetPlatformInfo error"), return ge::GRAPH_FAILED);
+    auto platformInfo = context->GetPlatformInfo();
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+    int64_t coreNum = ascendcPlatform.GetCoreNumAic();
+    if (coreNum == 0) return ge::GRAPH_FAILED;
 
-    // 2. Read layout attr (0=BSND, 1=TND)
-    int64_t layoutVal = 0;
-    auto layoutPtr = context->GetAttrs()->GetAttrPointer<int64_t>(0);
-    if (layoutPtr != nullptr) {
-        layoutVal = *layoutPtr;
-    }
-    OP_CHECK_IF(layoutVal != MODE_BSND && layoutVal != MODE_TND,
-                OP_LOGE(context, "SolveTril: invalid layout=%ld, expected 0(BSND) or 1(TND)", layoutVal),
-                return ge::GRAPH_FAILED);
-
-    // 3. Parse input shape
-    auto inputShape = context->GetInputShape(0);
-    OP_CHECK_NULL_WITH_CONTEXT(context, inputShape);
+    auto inputShape = context->GetInputShape(INPUT_X_IDX);
+    if (inputShape == nullptr) return ge::GRAPH_FAILED;
     auto shape = inputShape->GetStorageShape();
-    int64_t dimNum = shape.GetDimNum();
+    int64_t ndim = shape.GetDimNum();
+    if (ndim != 3 && ndim != 4) return ge::GRAPH_FAILED;
 
-    int64_t B, S, H, BT;
-    if (layoutVal == MODE_BSND) {
-        // BSND: [B, S, H, BT]
-        OP_CHECK_IF(dimNum != 4, OP_LOGE(context,
-            "SolveTril BSND mode expects 4D input [B,S,H,BT], got %ldD", dimNum),
-            return ge::GRAPH_FAILED);
-        B  = shape.GetDim(0);
-        S  = shape.GetDim(1);
-        H  = shape.GetDim(2);
-        BT = shape.GetDim(3);
+    auto attrs = context->GetAttrs();
+    int64_t chunkSize = *attrs->GetInt(ATTR_CHUNK_SIZE_IDX);
+    const char *layoutStr = attrs->GetStr(ATTR_LAYOUT_IDX);
+    std::string layout = layoutStr ? layoutStr : "bsnd";
+
+    int64_t layoutMode = 1;
+    if (layout == "bhtd") {
+        layoutMode = 0;
+    } else if (layout == "bsnd") {
+        layoutMode = 1;
+    } else if (layout == "tnd") {
+        layoutMode = 2;
+    }
+
+    int64_t B, H, T, BT;
+    if (ndim == 4) {
+        if (layoutMode == 0) {
+            B = shape.GetDim(0);
+            H = shape.GetDim(1);
+            T = shape.GetDim(2);
+            BT = shape.GetDim(3);
+        } else {
+            B = shape.GetDim(0);
+            T = shape.GetDim(1);
+            H = shape.GetDim(2);
+            BT = shape.GetDim(3);
+        }
     } else {
-        // TND: [T, H, BT] (B=1, S=T)
-        OP_CHECK_IF(dimNum != 3,
-            OP_LOGE(context, "SolveTril TND mode expects 3D input [T,H,BT], got %ldD", dimNum),
-            return ge::GRAPH_FAILED);
-        B  = 1;
-        S  = shape.GetDim(0);
-        H  = shape.GetDim(1);
+        B = 1;
+        T = shape.GetDim(0);
+        H = shape.GetDim(1);
         BT = shape.GetDim(2);
     }
 
-    // 4. Validate BT
-    OP_CHECK_IF(BT != 16 && BT != 32 && BT != 64 && BT != 128,
-                OP_LOGE(context, "SolveTril: BT=%ld not in {16,32,64,128}", BT),
-                return ge::GRAPH_FAILED);
+    if (chunkSize <= 0) chunkSize = BT;
 
-    // 5. Derived values
-    int64_t NT = CeilDiv(S, BT);
-    int64_t mbhLevels = 0;
-    if (BT == 32)      mbhLevels = 1;
-    else if (BT == 64) mbhLevels = 2;
-    else if (BT == 128)mbhLevels = 3;
+    int64_t isVarlen = (layoutMode == 2) ? 1 : 0;
+    int64_t hasCuSeqlens = isVarlen;
 
-    // 6. Compute tiling fields based on mode
-    int64_t chunkNumInSeq;
-    int64_t chunkNumTotal;
+    int64_t totalChunks = 0;
+    int64_t numChunks = 0;
+    int64_t totalTiles = 0;
+    int64_t lastChunkValidSize = 0;
 
-    if (layoutVal == MODE_BSND) {
-        chunkNumInSeq = NT;
-        chunkNumTotal = B * H * chunkNumInSeq;
+    if (isVarlen) {
+        auto chunkIndicesShape = context->GetInputShape(INPUT_CHUNK_INDICES_IDX);
+        int64_t chunkIndicesLen = chunkIndicesShape->GetStorageShape().GetDim(0);
+        totalChunks = chunkIndicesLen / 2;
+        totalTiles = totalChunks * H;
+        numChunks = 0;
+        lastChunkValidSize = 0;
     } else {
-        // TND mode: chunkNumTotal = chunk_indices.shape(0) * numHead
-        chunkNumInSeq = NT;  // invalid/meaningless in TND
-        auto chunkIndicesShape = context->GetOptionalInputShape(2);
-        OP_CHECK_IF(chunkIndicesShape == nullptr,
-            OP_LOGE(context, "SolveTril TND mode requires chunk_indices_out"),
-            return ge::GRAPH_FAILED);
-        int64_t numChunkIndices = chunkIndicesShape->GetStorageShape().GetDim(0);
-        chunkNumTotal = numChunkIndices * H;
+        totalChunks = 0;
+        numChunks = (T + chunkSize - 1) / chunkSize;
+        totalTiles = B * numChunks * H;
+        int64_t remainder = T % chunkSize;
+        lastChunkValidSize = (remainder == 0) ? chunkSize : remainder;
     }
 
-    // 7. Multi-core split
-    int64_t usedCoreNum = chunkNumTotal < coreNum ? chunkNumTotal : coreNum;
-    if (usedCoreNum == 0) usedCoreNum = 1;
-    int64_t taskPerCore = CeilDiv(chunkNumTotal, usedCoreNum);
+    int64_t tilesPerCore = (totalTiles + coreNum - 1) / coreNum;
 
-    // 8. Workspace
-    size_t* currentWorkspace = context->GetWorkspaceSizes(WORKSPACE_NUM);
-    OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
-    size_t wsSize = WS_SYS_SIZE;
-    if (mbhLevels >= 2) {
-        wsSize = static_cast<size_t>(chunkNumTotal) * static_cast<size_t>(BT) * BT * sizeof(float);
-    }
-    currentWorkspace[0] = wsSize;
+    SolveTrilTilingData tiling;
+    tiling.set_totalTiles(totalTiles);
+    tiling.set_matrixSize(chunkSize);
+    tiling.set_numHeads(H);
+    tiling.set_seqLen(T);
+    tiling.set_batchSize(B);
+    tiling.set_isLower(1);
+    tiling.set_hasCuSeqlens(hasCuSeqlens);
+    tiling.set_tilesPerCore(tilesPerCore);
+    tiling.set_chunkSize(chunkSize);
+    tiling.set_numChunks(numChunks);
+    tiling.set_lastChunkValidSize(lastChunkValidSize);
+    tiling.set_isVarlen(isVarlen);
+    tiling.set_totalChunks(totalChunks);
+    tiling.set_layoutMode(layoutMode);
 
-    // 9. Fill TilingData
-    SolveTrilTilingData* tiling = context->GetTilingData<SolveTrilTilingData>();
-    OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-    tiling->batchSize     = B;
-    tiling->seqLength     = S;
-    tiling->numHead       = H;
-    tiling->chunkSize     = BT;
-    tiling->chunkNumInSeq = chunkNumInSeq;
-    tiling->chunkNumTotal = chunkNumTotal;
-    tiling->mode          = static_cast<int32_t>(layoutVal);
-    tiling->blockDim      = usedCoreNum;
-    tiling->taskPerCore   = taskPerCore;
-    tiling->rowStride     = H * BT;
-    tiling->mbhLevels     = mbhLevels;
+    context->SetTilingKey(1);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    context->SetBlockDim(static_cast<uint32_t>(usedCoreNum));
+    int64_t usedCoreNum = (totalTiles + tilesPerCore - 1) / tilesPerCore;
+    if (usedCoreNum > coreNum) usedCoreNum = coreNum;
+    context->SetBlockDim(usedCoreNum);
 
-    // 10. TilingKey
-    auto inputDtype = context->GetInputDesc(0)->GetDataType();
-    uint32_t dType = static_cast<uint32_t>(inputDtype);
-    ASCENDC_TPL_SEL_PARAM(context, dType, static_cast<uint32_t>(mbhLevels));
+    uint32_t sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+    size_t sharedSize = 3 * chunkSize * chunkSize * sizeof(uint16_t);
+    size_t perCoreSize = chunkSize * chunkSize * sizeof(uint16_t);
+    size_t userWorkspaceSize = sharedSize + usedCoreNum * perCoreSize;
+    userWorkspaceSize = ((userWorkspaceSize + 511) / 512) * 512;
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = userWorkspaceSize + sysWorkspaceSize;
 
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus TilingParseForSolveTril([[maybe_unused]] gert::TilingParseContext* context)
+static ge::graphStatus SolveTrilTilingParse(gert::TilingParseContext* context)
 {
     return ge::GRAPH_SUCCESS;
 }
@@ -160,6 +136,6 @@ struct SolveTrilCompileInfo {};
 
 IMPL_OP_OPTILING(SolveTril)
     .Tiling(SolveTrilTilingFunc)
-    .TilingParse<SolveTrilCompileInfo>(TilingParseForSolveTril);
+    .TilingParse<SolveTrilCompileInfo>(SolveTrilTilingParse);
 
-} // namespace optiling
+}  // namespace optiling
