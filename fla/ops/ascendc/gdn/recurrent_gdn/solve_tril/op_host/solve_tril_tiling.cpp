@@ -131,7 +131,10 @@ static ge::graphStatus SolveTrilTilingFunc(gert::TilingContext* context)
 #else
     size_t sharedSize = 3 * chunkSize * chunkSize * sizeof(uint16_t);
     size_t perCoreSize = chunkSize * chunkSize * sizeof(uint16_t);
-    size_t userWorkspaceSize = sharedSize + usedCoreNum * perCoreSize;
+    // 每核需要 2 段 per-core 区：scratch（L0CToSlot 中转）+ xGM（MBH 调试时 X 的 GM 常驻副本，
+    // ExtractBlocksToSlot 从该区按块 GM->L1 提取，规避失效的 L1->GM 直拷）。
+    // 非调试构建多预留一段亦无害。
+    size_t userWorkspaceSize = sharedSize + 2 * usedCoreNum * perCoreSize;
 #endif
     userWorkspaceSize = ((userWorkspaceSize + 511) / 512) * 512;
     size_t* ws = context->GetWorkspaceSizes(1);

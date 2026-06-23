@@ -125,6 +125,12 @@ private:
     // MBH 调试：从 GM 入参把 MCH 输出（块对角逆）加载到 SLOT_X（NZ 格式），平台无关
     __aicore__ inline void LoadMchOutToSlotX(int64_t validSize = MATRIX_SIZE);
 #endif
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && !SOLVE_TRIL_PLATFORM_ASCEND950
+    // MBH 调试（GM-only 数据流）：按块从 GM 源提取到 L1，及 L0C->xGM 写回
+    __aicore__ inline void ExtractBlocksFromGM(GlobalTensor<half> srcGM, int32_t dstSlot,
+                                                int32_t blockSize, int32_t startBlock);
+    __aicore__ inline void SpillL0CToXGM();
+#endif
     __aicore__ inline void ClearSlot(int32_t slot);
 
 private:
@@ -160,6 +166,11 @@ private:
     LocalTensor<half> ubWorkIn_;
 #else
     GlobalTensor<half> scratchGM_;
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // MBH 调试：X 的 GM 常驻副本。ExtractBlocksToSlot 从这里按块 GM->L1 提取
+    // （避免该 arch 上失效的 L1->GM 原始 DataCopy）。
+    GlobalTensor<half> xGM_;
+#endif
 
     TBuf<TPosition::A1> l1Buf_;
     LocalTensor<half> l1_;
@@ -264,6 +275,15 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
 #else
     int64_t scratchOffset = GM_NUM_SHARED_SLOTS * TILE_LEN + aicIdx_ * TILE_LEN;
     scratchGM_ = workspaceGM_[scratchOffset];
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // X 的 GM 常驻副本，放在所有 per-core scratch 之后，每核独占 TILE_LEN。
+    // 容量由 tiling 的 userWorkspaceSize 预留（见 solve_tril_tiling.cpp）。
+    int64_t numCores = static_cast<int64_t>(GetBlockNum());
+    int64_t xGmOffset = GM_NUM_SHARED_SLOTS * TILE_LEN
+                      + numCores * TILE_LEN
+                      + aicIdx_ * TILE_LEN;
+    xGM_ = workspaceGM_[xGmOffset];
+#endif
 
     pipe_.InitBuffer(l1Buf_, L1_TOTAL_ELEMS * sizeof(half));
     l1_ = l1Buf_.Get<half>();
@@ -701,6 +721,61 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadMchOutToSlotX(int64_t val
 }
 #endif  // SOLVE_TRIL_MBH_DEBUG_ONLY
 
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && !SOLVE_TRIL_PLATFORM_ASCEND950
+// ---- MBH(GM-only 数据流，规避该 arch 上失效的 L1->GM 直拷) ----
+// 本 arch 实测：raw L1->GM DataCopy 为静默 no-op，导致 ExtractBlocksToSlot 失效。
+// 解决：X 始终以 GM 副本（mch_out 或 xGM_）为权威源，按块经 GM->L1 nd2nz 提取
+//（GM->L1 已验证可用），层间结果用 Fixpipe L0C->GM（已验证）写回 xGM_。
+
+// 把 srcGM(ND, BT×BT) 中选定的对角/非对角块，按 NZ 分形布局提取到 L1 dstSlot。
+// 与原 ExtractBlocksToSlot 选块逻辑一致：从 startBlock 起步长 2 取块；只是源在 GM。
+template <int MATRIX_SIZE>
+__aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ExtractBlocksFromGM(
+    GlobalTensor<half> srcGM, int32_t dstSlot, int32_t blockSize, int32_t startBlock)
+{
+    int32_t numBlocks = MATRIX_SIZE / blockSize;
+    int32_t fracsPerBlock = blockSize / FRAC;
+
+    ClearSlot(dstSlot);
+    PipeBarrier<PIPE_MTE2>();
+
+    // 逐 16×16 分形：从 GM(ND) 的 (row,col) 分形位置 -> L1(NZ) 同一分形偏移。
+    // GM ND 中分形 (fr,fc) 的元素 (r,c) 偏移 = (fr*FRAC+r)*MATRIX_SIZE + (fc*FRAC+c)。
+    Nd2NzParams p;
+    p.ndNum = 1;
+    p.nValue = FRAC;
+    p.dValue = FRAC;
+    p.srcDValue = MATRIX_SIZE;        // GM ND 行步长
+    p.srcNdMatrixStride = 0;
+    p.dstNzNStride = 1;
+    p.dstNzC0Stride = MATRIX_SIZE;    // 与整槽 NZ 布局一致（dstNz 的 C0 跨度=BT）
+    p.dstNzMatrixStride = 0;
+
+    for (int32_t blk = startBlock; blk < numBlocks; blk += 2) {
+        for (int32_t fi = 0; fi < fracsPerBlock; fi++) {
+            for (int32_t fj = 0; fj < fracsPerBlock; fj++) {
+                int32_t fr = blk * fracsPerBlock + fi;   // 分形行号
+                int32_t fc = blk * fracsPerBlock + fj;   // 分形列号
+                int32_t srcOff = (fr * FRAC) * MATRIX_SIZE + (fc * FRAC);  // GM ND 偏移
+                int32_t dstOff = (fc * NUM_FRACS + fr) * FRAC_LEN;          // L1 NZ 偏移
+                DataCopy(l1_[dstSlot * L1_SLOT_ELEMS + dstOff], srcGM[srcOff], p);
+            }
+        }
+    }
+    SetFlag<HardEvent::MTE2_MTE1>(EVT_MTE2_MTE1);
+    WaitFlag<HardEvent::MTE2_MTE1>(EVT_MTE2_MTE1);
+}
+
+// L0C(FP32) -> xGM_(FP16, ND)，Fixpipe 直写（已验证 L0C->GM 可用）。供下一层提取。
+template <int MATRIX_SIZE>
+__aicore__ inline void SolveTrilCube<MATRIX_SIZE>::SpillL0CToXGM()
+{
+    NsSolveTril::L0CToGM(xGM_, l0c_, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE);
+    SetFlag<HardEvent::FIX_MTE2>(EVT_FIX_MTE2);
+    WaitFlag<HardEvent::FIX_MTE2>(EVT_FIX_MTE2);
+}
+#endif  // SOLVE_TRIL_MBH_DEBUG_ONLY && !SOLVE_TRIL_PLATFORM_ASCEND950
+
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ClearSlot(int32_t slot)
 {
@@ -911,6 +986,46 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadFullInputForMBH(int64_t g
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
 {
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && !SOLVE_TRIL_PLATFORM_ASCEND950
+    // ===== MBH 调试：GM-only 数据流（规避失效的 L1->GM 直拷）=====
+    // X 的权威副本在 GM：第 0 层为 mch_out，之后为 xGM_（由 SpillL0CToXGM 写回）。
+    // 所有块提取改为 ExtractBlocksFromGM（GM->L1，已验证）。
+    GlobalTensor<half> xSrc = mchOutGM_;   // 当前 X 的 GM 源
+    for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
+        int32_t drvStart = isLower_ ? 1 : 0;
+        int32_t othStart = isLower_ ? 0 : 1;
+
+        // step A: 提取驱动对角块 -> SLOT_Y
+        ExtractBlocksFromGM(xSrc, SLOT_Y, blockSize, drvStart);
+        // step B: L0C = I × I = 完整单位阵（用空闲 SLOT_INPUT 暂存 I）
+        MatmulToL0C(SLOT_I, SLOT_I, true);
+        SetFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+        WaitFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+        // step C: Y = Y × (-A) + I（累加到 step B 的 L0C=I）
+        MatmulToSlot(SLOT_Y, SLOT_MNEG, SLOT_Y, false);
+
+        // step D: 提取非驱动对角块(L11_inv 等) -> SLOT_INPUT
+        ExtractBlocksFromGM(xSrc, SLOT_INPUT, blockSize, othStart);
+        // step E: L0C = Y × INPUT
+        MatmulToL0C(SLOT_Y, SLOT_INPUT, true);
+        SetFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+        WaitFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+        SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        // step F: 提取驱动对角块 -> SLOT_INPUT（准备累加对角逆）
+        ExtractBlocksFromGM(xSrc, SLOT_INPUT, blockSize, drvStart);
+        // step G: L0C += I × INPUT
+        MatmulToL0C(SLOT_I, SLOT_INPUT, false);
+        SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+
+        if (blockSize < MATRIX_SIZE / 2) {
+            // 层间结果 L0C -> xGM_（Fixpipe，已验证），下一层从 xGM_ 提取
+            SpillL0CToXGM();
+            xSrc = xGM_;
+        }
+    }
+#else
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
         int32_t drvStart = isLower_ ? 1 : 0;
         int32_t othStart = isLower_ ? 0 : 1;
@@ -967,6 +1082,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
             WaitFlag<HardEvent::MTE2_MTE3>(EVT_MTE2_MTE3);
         }
     }
+#endif
 }
 
 template <int MATRIX_SIZE>
