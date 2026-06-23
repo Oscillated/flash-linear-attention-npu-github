@@ -674,8 +674,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadAuxMatricesFromGM()
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadMchOutToSlotX(int64_t validSize)
 {
-    ClearSlot(SLOT_X);
-    PipeBarrier<PIPE_MTE3>();
+    ClearSlot(SLOT_X);   // 自带 PipeBarrier<PIPE_ALL>，清零完成后再加载 mch_out
 
     Nd2NzParams nd2nzParams;
     nd2nzParams.ndNum = 1;
@@ -702,7 +701,11 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ClearSlot(int32_t slot)
     params.srcStride = 0;
     params.dstStride = 0;
 #if SOLVE_TRIL_PLATFORM_ASCEND950
+    // Ascend950: 清零源是 UB(ubZero_)，走 MTE3 (UB->L1)。
+    // 自带 PipeBarrier<PIPE_ALL>，确保清零完成后调用方再向该 slot 写入
+    // （后续可能是 MTE2 的 GM->L1 加载或 MTE3 的分形块拷贝），避免 WAW 竞争。
     DataCopy(l1_[slot * L1_SLOT_ELEMS], ubZero_, params);
+    PipeBarrier<PIPE_ALL>();
 #else
     DataCopy(l1_[slot * L1_SLOT_ELEMS], workspaceGM_[GM_WS_ZERO * TILE_LEN], params);
 #endif
@@ -716,14 +719,11 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ExtractBlocksToSlot(
     int32_t fracsPerBlock = blockSize / FRAC;
 
     ClearSlot(dstSlot);
-#if SOLVE_TRIL_PLATFORM_ASCEND950
-    // ClearSlot 在 950 上是 UB(ubZero_)->L1 的 MTE3 搬运，需在后续向同一 slot
-    // 写入分形块前完成，用 PipeBarrier<PIPE_ALL> 保证。
-    PipeBarrier<PIPE_ALL>();
-#else
+#if !SOLVE_TRIL_PLATFORM_ASCEND950
     SetFlag<HardEvent::MTE2_MTE3>(EVT_MTE2_MTE3);
     WaitFlag<HardEvent::MTE2_MTE3>(EVT_MTE2_MTE3);
 #endif
+    // 注：950 上 ClearSlot 内部已 PipeBarrier<PIPE_ALL>，此处无需额外同步。
 
     DataCopyParams copyParams;
     copyParams.blockCount = 1;

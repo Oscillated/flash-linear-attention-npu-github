@@ -9,8 +9,13 @@
 #include "kernel_operator.h"
 
 // ========== Ascend950 平台检测 ==========
-// 根据芯片架构宏判断是否为 Ascend950 系列
-#if defined(__ASCEND950__) || defined(ASCENDC_PLATFORM_ASCEND950)
+// 设备侧编译宏：Ascend950 (arch35) 对应 __CCE_AICORE__ == 310，
+// Ascend910b 对应 __CCE_AICORE__ == 220。与本仓库其他算子（如
+// recurrent_gated_delta_rule）选择 arch35 实现所用的判据保持一致。
+// 注意：旧版曾用 __ASCEND950__ / ASCENDC_PLATFORM_ASCEND950，这两个宏
+// 实际并不会被编译器定义，会导致 950 代码路径永远不参与编译。
+#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310) || \
+    defined(__ASCEND950__) || defined(ASCENDC_PLATFORM_ASCEND950)
 #define SOLVE_TRIL_PLATFORM_ASCEND950 1
 #else
 #define SOLVE_TRIL_PLATFORM_ASCEND950 0
