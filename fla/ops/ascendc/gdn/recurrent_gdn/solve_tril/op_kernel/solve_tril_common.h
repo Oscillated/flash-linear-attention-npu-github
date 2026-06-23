@@ -8,18 +8,16 @@
 
 #include "kernel_operator.h"
 
-// ========== Ascend950 平台检测 ==========
-// 设备侧编译宏：Ascend950 (arch35) 对应 __CCE_AICORE__ == 310，
-// Ascend910b 对应 __CCE_AICORE__ == 220。与本仓库其他算子（如
-// recurrent_gated_delta_rule）选择 arch35 实现所用的判据保持一致。
-// 注意：旧版曾用 __ASCEND950__ / ASCENDC_PLATFORM_ASCEND950，这两个宏
-// 实际并不会被编译器定义，会导致 950 代码路径永远不参与编译。
-#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310) || \
-    defined(__ASCEND950__) || defined(ASCENDC_PLATFORM_ASCEND950)
-#define SOLVE_TRIL_PLATFORM_ASCEND950 1
-#else
+// ========== Ascend950 平台检测 / UB 优化开关 ==========
+// 经实测：Ascend950(arch35) 上把"辅助矩阵在 AIC 核的 UB 上自生成 + UB↔L1 直通"
+// 的方案跑不通——AIC(cube)核访问 UB / 执行向量指令(Duplicate/Muls/DataCopy↔UB)
+// 得到的是 0/垃圾值（BT=16 输出恒为 0 即为佐证）。因此暂时关闭该 UB 优化路径，
+// 在 950 上沿用经验证可用的 910b GM 通路（AIV 生成 I/-I/Zero 到 GM，AIC 经
+// GM 加载 + GM scratch 中转）。KERNEL_TYPE_MIX_AIC_1_2 在 950 上同样可用。
+//
+// 待确认 arch35 的 AIC 核确实可访问 UB 后，再将本宏改回基于
+// (__CCE_AICORE__ == 310) 的检测以启用 UB 优化。
 #define SOLVE_TRIL_PLATFORM_ASCEND950 0
-#endif
 
 #if SOLVE_TRIL_PLATFORM_ASCEND950
 // Ascend950: 纯 AIC 模式，无 AIC↔AIV 同步需求

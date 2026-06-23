@@ -18,11 +18,11 @@ extern "C" __global__ __aicore__ void solve_tril(GM_ADDR x, GM_ADDR cu_seqlens, 
 {
     GET_TILING_DATA(tilingData, tiling);
     if (TILING_KEY_IS(1)) {
-#if SOLVE_TRIL_PLATFORM_ASCEND950
-        KERNEL_TASK_TYPE(1, KERNEL_TYPE_AIC);
-#else
+        // Ascend950(arch35) 不支持纯 KERNEL_TYPE_AIC，cube 类算子统一使用
+        // KERNEL_TYPE_MIX_AIC_1_2（与本仓库其他 arch35 cube 算子一致）。
+        // 950 上 AIV 核被调度但不执行任何逻辑（AIV 代码段已条件编译屏蔽），
+        // 辅助矩阵由 AIC 在 UB 上自生成/加载，二者无需 SyncAll 交汇。
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
-#endif
 
         int64_t ms = tilingData.matrixSize;
         int64_t totalTiles = tilingData.totalTiles;
