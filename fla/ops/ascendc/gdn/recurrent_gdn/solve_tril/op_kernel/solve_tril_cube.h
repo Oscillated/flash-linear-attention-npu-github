@@ -394,8 +394,15 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
 #endif
 
         if constexpr (MATRIX_SIZE > FRAC) {
+#if SOLVE_TRIL_MBH_PASSTHROUGH
+            // 诊断：跳过 MBH，仅 X×I 写回，验证多分形 matmul + 写回是否正确（应得 mch_out）
+            MatmulToL0C(SLOT_X, SLOT_I, true);
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#else
             LoadFullInputForMBH(gmOffset);
             RecursiveMerge();
+#endif
         } else {
 #if SOLVE_TRIL_PLATFORM_ASCEND950
             LoadAuxToL1(ubI_, SLOT_Y);

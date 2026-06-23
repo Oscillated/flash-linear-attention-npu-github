@@ -107,6 +107,28 @@ def test_solve_tril_mbh(BT, layout="bhtd", dtype=torch.float16, seed=42):
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] MBH layout={layout} BT={BT}: "
           f"max_diff={max_diff:.6f}, verify_err={verify_err:.6f}")
+
+    # ===== 诊断：逐 16×16 子块对比，定位 MBH 输出哪一块出错 =====
+    # out_block_err : 算子输出 vs golden 的逐块最大误差
+    # diag_vs_mch   : 输出对角块 vs 注入的 mch_out 对角块（应一致，因 MBH 保留对角逆）
+    # 仅在失败且块数不太多时打印，避免刷屏。
+    if (not passed) and BT <= 64:
+        nf = BT // FRAC
+        print(f"      --- block-wise diagnosis (BT={BT}, {nf}x{nf} blocks of 16) ---")
+        for bi in range(nf):
+            row_err = []
+            for bj in range(nf):
+                o = inv_block[bi*FRAC:(bi+1)*FRAC, bj*FRAC:(bj+1)*FRAC]
+                g = golden_np[bi*FRAC:(bi+1)*FRAC, bj*FRAC:(bj+1)*FRAC]
+                tag = "diag" if bi == bj else ("low " if bi > bj else "up  ")
+                row_err.append(f"({bi},{bj}){tag} err={np.abs(o-g).max():.4f}")
+            print("        " + " | ".join(row_err))
+        # 对角块是否等于注入的 mch_out（MBH 应原样保留对角逆块）
+        for bi in range(nf):
+            o = inv_block[bi*FRAC:(bi+1)*FRAC, bi*FRAC:(bi+1)*FRAC]
+            m = mch_np[bi*FRAC:(bi+1)*FRAC, bi*FRAC:(bi+1)*FRAC]
+            print(f"        diag block {bi}: out-vs-mchOut max={np.abs(o-m).max():.4f}, "
+                  f"out[0,0]={o[0,0]:.4f} mch[0,0]={m[0,0]:.4f}")
     return passed
 
 
