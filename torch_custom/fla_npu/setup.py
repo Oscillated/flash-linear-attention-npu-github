@@ -76,6 +76,9 @@ def get_include_dirs():
 
 def get_compile_args():
     compile_args = ["-std=c++17"]
+    # MBH 调试模式：启用 solve_tril 的 MCH 输出 / 全 0 矩阵 / 单位矩阵 调试入参。
+    # 屏蔽 MCH 实现、单独调试 MBH 模块时打开；正式构建时移除该宏。
+    compile_args.append("-DSOLVE_TRIL_MBH_DEBUG_ONLY=1")
     # for Windows
     if sys.platform == "win32":
         compile_args.append("/MD")

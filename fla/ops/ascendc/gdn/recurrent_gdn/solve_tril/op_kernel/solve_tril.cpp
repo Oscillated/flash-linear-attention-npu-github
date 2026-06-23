@@ -13,6 +13,7 @@
 using namespace AscendC;
 
 extern "C" __global__ __aicore__ void solve_tril(GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+                                                GM_ADDR mch_out, GM_ADDR zero_mat, GM_ADDR eye_mat,
                                                 GM_ADDR x_out, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
@@ -30,19 +31,19 @@ extern "C" __global__ __aicore__ void solve_tril(GM_ADDR x, GM_ADDR cu_seqlens, 
         if ASCEND_IS_AIC {
             if (ms == 16) {
                 NsSolveTril::SolveTrilCube<16> op;
-                op.Init(x, cu_seqlens, chunk_indices, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
                 op.Process();
             } else if (ms == 32) {
                 NsSolveTril::SolveTrilCube<32> op;
-                op.Init(x, cu_seqlens, chunk_indices, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
                 op.Process();
             } else if (ms == 64) {
                 NsSolveTril::SolveTrilCube<64> op;
-                op.Init(x, cu_seqlens, chunk_indices, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
                 op.Process();
             } else if (ms == 128) {
                 NsSolveTril::SolveTrilCube<128> op;
-                op.Init(x, cu_seqlens, chunk_indices, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
                 op.Process();
             }
         }

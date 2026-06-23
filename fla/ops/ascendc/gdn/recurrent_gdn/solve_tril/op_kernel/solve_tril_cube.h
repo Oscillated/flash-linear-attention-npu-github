@@ -85,6 +85,7 @@ class SolveTrilCube {
 public:
     __aicore__ inline SolveTrilCube() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+                                GM_ADDR mch_out, GM_ADDR zero_mat, GM_ADDR eye_mat,
                                 GM_ADDR x_out, GM_ADDR workspace,
                                 const SolveTrilTilingData* tilingData);
     __aicore__ inline void Process();
@@ -116,6 +117,12 @@ private:
     __aicore__ inline void L0CToUB_X();
     __aicore__ inline void LoadUBXToL1(int32_t slotDst);
 #endif
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && SOLVE_TRIL_PLATFORM_ASCEND950
+    // MBH 调试：从 GM 入参把 MCH 输出（块对角逆）加载到 SLOT_X（NZ 格式）
+    __aicore__ inline void LoadMchOutToSlotX(int64_t validSize = MATRIX_SIZE);
+    // MBH 调试：从 GM 入参把 单位矩阵/全 0 矩阵 加载进 UB（替代片上生成）
+    __aicore__ inline void LoadAuxMatricesFromGM();
+#endif
     __aicore__ inline void ClearSlot(int32_t slot);
 
 private:
@@ -123,6 +130,12 @@ private:
     GlobalTensor<half> inputGM_;
     GlobalTensor<half> outputGM_;
     GlobalTensor<half> workspaceGM_;
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // MBH 调试入参：MCH 输出（块对角逆）、全 0 矩阵、单位矩阵
+    GlobalTensor<half> mchOutGM_;
+    GlobalTensor<half> zeroMatGM_;
+    GlobalTensor<half> eyeMatGM_;
+#endif
 #if SOLVE_TRIL_PLATFORM_ASCEND950
     // Ascend950: UB 替代 GM scratch，不需要 scratchGM_
 
@@ -185,6 +198,7 @@ private:
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
     GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+    GM_ADDR mch_out, GM_ADDR zero_mat, GM_ADDR eye_mat,
     GM_ADDR x_out, GM_ADDR workspace,
     const SolveTrilTilingData* tilingData)
 {
@@ -213,6 +227,13 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
     inputGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(x));
     outputGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(x_out));
     workspaceGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(workspace));
+
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // MBH 调试入参绑定：mch_out/zero_mat/eye_mat 均为 BT×BT 的 ND 半精度矩阵
+    mchOutGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(mch_out));
+    zeroMatGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(zero_mat));
+    eyeMatGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(eye_mat));
+#endif
 
     if (isVarlen_) {
         cuSeqlensGM_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(cu_seqlens));
@@ -265,7 +286,12 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Process()
     }
 
 #if SOLVE_TRIL_PLATFORM_ASCEND950
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // MBH 调试：单位矩阵 / 全 0 矩阵 来自接口入参，直接加载进 UB（替代片上生成）
+    LoadAuxMatricesFromGM();
+#else
     GenerateAuxMatricesOnUB();
+#endif
 #else
     SyncAll<false>();
     PrepareConstants();
@@ -352,6 +378,26 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
     if (validSize < matrixSize_) {
         ProcessPartialTile(gmOffset, validSize);
     } else {
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && SOLVE_TRIL_PLATFORM_ASCEND950
+        // ===== MBH 调试模式：屏蔽 MCH，X 直接来自接口入参 mch_out =====
+        // mch_out 已是 BT×BT 的块对角逆矩阵（含 BT/16 个 16×16 对角逆块），
+        // 等价于原 MCHInvertDiagonal() 的输出，加载进 SLOT_X 后直接进入 MBH。
+        // LoadInputTile(gmOffset);   // MCH 输入加载（已屏蔽）
+        // MCHInvertDiagonal();       // MCH 求对角块逆（已屏蔽）
+        LoadMchOutToSlotX();
+
+        if constexpr (MATRIX_SIZE > FRAC) {
+            LoadFullInputForMBH(gmOffset);
+            RecursiveMerge();
+        } else {
+            // BT=16：无 MBH 层，X(=mch_out) 即最终结果，X×I 落到 L0C 输出
+            LoadAuxToL1(ubI_, SLOT_Y);
+            MatmulToL0C(SLOT_X, SLOT_Y, true);
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        }
+        StoreFinalResult(gmOffset);
+#else
         LoadInputTile(gmOffset);
 
         MCHInvertDiagonal();
@@ -370,6 +416,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
         }
         StoreFinalResult(gmOffset);
+#endif
     }
 }
 
@@ -593,6 +640,58 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadUBXToL1(int32_t slotDst)
     WaitFlag<HardEvent::MTE3_MTE1>(EVT_MTE2_MTE1);
 }
 #endif  // SOLVE_TRIL_PLATFORM_ASCEND950
+
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && SOLVE_TRIL_PLATFORM_ASCEND950
+// ========== MBH 调试模式新增函数 ==========
+
+// 从接口入参把 单位矩阵(eye_mat) / 全 0 矩阵(zero_mat) 加载进 UB，
+// 并由 单位矩阵 取负得到 -I，替代原 GenerateAuxMatricesOnUB() 的片上生成。
+// eye_mat / zero_mat 均为 BT×BT 的 ND 半精度矩阵。
+template <int MATRIX_SIZE>
+__aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadAuxMatricesFromGM()
+{
+    DataCopyParams params;
+    params.blockCount = 1;
+    params.blockLen = TILE_LEN * sizeof(half) / 32;  // 32B 对齐的块数
+    params.srcStride = 0;
+    params.dstStride = 0;
+
+    // GM(ND) -> UB(ND)：单位矩阵 I、全 0 矩阵 Zero
+    DataCopy(ubI_, eyeMatGM_, params);
+    DataCopy(ubZero_, zeroMatGM_, params);
+    SetFlag<HardEvent::MTE2_V>(0);
+    WaitFlag<HardEvent::MTE2_V>(0);
+
+    // -I = (-1) * I（在 UB 上用 vector 取负，避免再引入一个 GM 入参）
+    Muls(ubINeg_, ubI_, half(-1.0f), TILE_LEN);
+
+    // 确保 ubI_/ubINeg_/ubZero_ 全部就绪后，再由后续 MTE3（UB->L1）读取
+    PipeBarrier<PIPE_ALL>();
+}
+
+// 将接口入参 mch_out（BT×BT 块对角逆矩阵，ND 格式）加载进 L1 SLOT_X（NZ 格式），
+// 作为 MBH 递归的初始 X，等价于原 MCHInvertDiagonal() 的输出。
+template <int MATRIX_SIZE>
+__aicore__ inline void SolveTrilCube<MATRIX_SIZE>::LoadMchOutToSlotX(int64_t validSize)
+{
+    ClearSlot(SLOT_X);
+    PipeBarrier<PIPE_MTE3>();
+
+    Nd2NzParams nd2nzParams;
+    nd2nzParams.ndNum = 1;
+    nd2nzParams.nValue = static_cast<uint32_t>(validSize);
+    nd2nzParams.dValue = static_cast<uint32_t>(validSize);
+    nd2nzParams.srcDValue = MATRIX_SIZE;   // mch_out 为独立的 BT×BT ND 矩阵，行步长=BT
+    nd2nzParams.srcNdMatrixStride = 0;
+    nd2nzParams.dstNzNStride = 1;
+    nd2nzParams.dstNzC0Stride = MATRIX_SIZE;
+    nd2nzParams.dstNzMatrixStride = 0;
+
+    DataCopy(l1_[SLOT_X * L1_SLOT_ELEMS], mchOutGM_, nd2nzParams);
+    SetFlag<HardEvent::MTE2_MTE1>(EVT_MTE2_MTE1);
+    WaitFlag<HardEvent::MTE2_MTE1>(EVT_MTE2_MTE1);
+}
+#endif  // SOLVE_TRIL_MBH_DEBUG_ONLY && SOLVE_TRIL_PLATFORM_ASCEND950
 
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ClearSlot(int32_t slot)
@@ -854,6 +953,24 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessPartialTile(int64_t gmOffset, int64_t validSize)
 {
+#if SOLVE_TRIL_MBH_DEBUG_ONLY && SOLVE_TRIL_PLATFORM_ASCEND950
+    // MBH 调试模式：屏蔽 MCH，X 直接来自接口入参 mch_out（只取 validSize 部分）
+    // LoadInputTile(gmOffset, validSize);   // MCH 输入加载（已屏蔽）
+    // MCHInvertDiagonal();                   // MCH 求对角块逆（已屏蔽）
+    LoadMchOutToSlotX(validSize);
+
+    if constexpr (MATRIX_SIZE > FRAC) {
+        LoadFullInputForMBH(gmOffset, validSize);
+        RecursiveMerge();
+    } else {
+        LoadAuxToL1(ubI_, SLOT_Y);
+        MatmulToL0C(SLOT_X, SLOT_Y, true);
+        SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+    }
+
+    StoreFinalResult(gmOffset, validSize);
+#else
     LoadInputTile(gmOffset, validSize);
 
     MCHInvertDiagonal();
@@ -873,6 +990,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessPartialTile(int64_t gm
     }
 
     StoreFinalResult(gmOffset, validSize);
+#endif
 }
 
 }  // namespace NsSolveTril

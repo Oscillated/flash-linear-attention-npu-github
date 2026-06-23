@@ -330,7 +330,11 @@ at::Tensor npu_causal_conv1d(
     return y;
 }
 
-at::Tensor npu_solve_tril(const at::Tensor & x, int64_t chunk_size, at::OptionalIntArrayRef cu_seqlens, at::OptionalIntArrayRef chunk_indices, c10::string_view layout)
+at::Tensor npu_solve_tril(const at::Tensor & x, int64_t chunk_size, at::OptionalIntArrayRef cu_seqlens, at::OptionalIntArrayRef chunk_indices, c10::string_view layout
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    , const c10::optional<at::Tensor> & mch_output, const c10::optional<at::Tensor> & zero_matrix, const c10::optional<at::Tensor> & identity_matrix
+#endif
+    )
 {
     auto output_size = x.sizes();
     auto output_dtype = x.scalar_type();
@@ -338,7 +342,15 @@ at::Tensor npu_solve_tril(const at::Tensor & x, int64_t chunk_size, at::Optional
                                                                   x.options().dtype(output_dtype));
     std::string layout_str(layout);
     const char *layout_cstr = layout_str.c_str();
+#if SOLVE_TRIL_MBH_DEBUG_ONLY
+    // MBH 调试模式：透传 MCH 输出 / 全 0 矩阵 / 单位矩阵。
+    // 注意 aclnn 入参顺序与 op_def 注册顺序一致：
+    //   x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, chunk_size, layout, out
+    EXEC_NPU_CMD_EXT(aclnnSolveTril, x, cu_seqlens, chunk_indices,
+                     mch_output, zero_matrix, identity_matrix, chunk_size, layout_cstr, out);
+#else
     EXEC_NPU_CMD_EXT(aclnnSolveTril, x, cu_seqlens, chunk_indices, chunk_size, layout_cstr, out);
+#endif
     return out;
 }
 

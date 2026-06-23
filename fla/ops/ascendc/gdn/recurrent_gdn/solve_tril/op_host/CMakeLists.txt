@@ -16,6 +16,9 @@ endif()
 
 add_modules_sources(OPTYPE solve_tril ACLNNTYPE aclnn_exclude)
 
+# MBH 调试模式：屏蔽 MCH，MCH 输出/全 0 矩阵/单位矩阵 作为接口入参，单独调试 MBH 模块。
+# 正式构建时移除 -DSOLVE_TRIL_MBH_DEBUG_ONLY=1。
 add_ops_compile_options(OP_NAME SolveTril OPTIONS
     --cce-auto-sync=off
+    -DSOLVE_TRIL_MBH_DEBUG_ONLY=1
 )
