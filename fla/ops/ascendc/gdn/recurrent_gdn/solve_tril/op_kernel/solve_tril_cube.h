@@ -460,6 +460,15 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             MatmulToL0C(SLOT_INPUT, SLOT_I, false);        // L0C += A×I = I + A
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#elif SOLVE_TRIL_MBH_PASSTHROUGH == 8
+            // 诊断8：同 mode6，但两次 matmul 间加 PipeBarrier<PIPE_ALL>。
+            // 若输出 == I+A → 累加问题是同步竞争（缺 barrier）；否则是结构性问题。
+            LoadFullInputForMBH(gmOffset);
+            MatmulToL0C(SLOT_I, SLOT_I, true);             // L0C = I
+            PipeBarrier<PIPE_ALL>();
+            MatmulToL0C(SLOT_INPUT, SLOT_I, false);        // L0C += A×I
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
 #elif SOLVE_TRIL_MBH_PASSTHROUGH == 7
             // 诊断7：测试 MatmulToSlot 读写同槽 + L0CToSlot 回写（merge step C 的形态）。
             // 先 SLOT_INPUT=A；SLOT_Y<-A 的拷贝经 matmul：MatmulToSlot(SLOT_INPUT,SLOT_I,SLOT_Y)
