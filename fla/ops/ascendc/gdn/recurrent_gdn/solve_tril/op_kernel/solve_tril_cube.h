@@ -436,6 +436,19 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             MatmulToL0C(SLOT_MNEG, SLOT_I, true);          // MNEG × I = MNEG
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#elif SOLVE_TRIL_MBH_PASSTHROUGH == 4
+            // 诊断4：A 在 B 位：输出 I × A（A=完整严格下三角，载于 SLOT_INPUT）。
+            // 期望 == A（严格下三角）。用已知非对称、非块对角的 A 探测 B 算子放置语义。
+            LoadFullInputForMBH(gmOffset);                 // A -> SLOT_INPUT（顺带算 MNEG，忽略）
+            MatmulToL0C(SLOT_I, SLOT_INPUT, true);         // I × A
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#elif SOLVE_TRIL_MBH_PASSTHROUGH == 5
+            // 诊断5：A 在 A 位：输出 A × I。期望 == A。探测 A 算子放置语义。
+            LoadFullInputForMBH(gmOffset);                 // A -> SLOT_INPUT
+            MatmulToL0C(SLOT_INPUT, SLOT_I, true);         // A × I
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
 #else
             LoadFullInputForMBH(gmOffset);
             RecursiveMerge();
@@ -471,15 +484,12 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::MatmulToL0C(int32_t slotA, in
     LoadData2DParams loadParamsB;
     loadParamsB.startIndex = 0;
     loadParamsB.repeatTimes = NUM_FRACS;
-    loadParamsB.srcStride = 1;
+    loadParamsB.srcStride = NUM_FRACS;
     loadParamsB.dstGap = 0;
     loadParamsB.ifTranspose = true;
 
     for (int32_t i = 0; i < NUM_FRACS; ++i) {
-        // B 算子需"块级转置"：cube 在 ifTranspose=true 下会对 B 做块级转置(经实测+诊断确认)，
-        // 故须把源分形块预先按 (i,k)<-src(k,i) 交换，使 cube 还原出 plain B。
-        // 否则非对角分形会镜像到 (fc,fr) 位置（NUM_FRACS>1 才暴露；=1 时 i*NF==i 无影响）。
-        int32_t srcOffsetB = slotB * L1_SLOT_ELEMS + i * NUM_FRACS * FRAC_LEN;
+        int32_t srcOffsetB = slotB * L1_SLOT_ELEMS + i * FRAC_LEN;
         int32_t dstOffsetB = i * NUM_FRACS * FRAC_LEN;
         LoadData(l0b_[dstOffsetB], l1_[srcOffsetB], loadParamsB);
     }
@@ -516,15 +526,12 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::MatmulToL0CTest(int32_t slotA
     LoadData2DParams loadParamsB;
     loadParamsB.startIndex = 0;
     loadParamsB.repeatTimes = NUM_FRACS;
-    loadParamsB.srcStride = 1;
+    loadParamsB.srcStride = NUM_FRACS;
     loadParamsB.dstGap = 0;
     loadParamsB.ifTranspose = true;
 
     for (int32_t i = 0; i < NUM_FRACS; ++i) {
-        // B 算子需"块级转置"：cube 在 ifTranspose=true 下会对 B 做块级转置(经实测+诊断确认)，
-        // 故须把源分形块预先按 (i,k)<-src(k,i) 交换，使 cube 还原出 plain B。
-        // 否则非对角分形会镜像到 (fc,fr) 位置（NUM_FRACS>1 才暴露；=1 时 i*NF==i 无影响）。
-        int32_t srcOffsetB = slotB * L1_SLOT_ELEMS + i * NUM_FRACS * FRAC_LEN;
+        int32_t srcOffsetB = slotB * L1_SLOT_ELEMS + i * FRAC_LEN;
         int32_t dstOffsetB = i * NUM_FRACS * FRAC_LEN;
         LoadData(l0b_[dstOffsetB], l1_[srcOffsetB], loadParamsB);
     }

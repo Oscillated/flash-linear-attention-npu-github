@@ -101,25 +101,22 @@ def test_solve_tril_mbh(BT, layout="bhtd", dtype=torch.float16, seed=42):
     import os
     if os.environ.get("MBH_DIAG_MNEG") == "1":
         negA = -block_np
-        negAT = -block_np.T
+        A_ref = block_np
+        # 同时给出与 A 和 -A 的比较（mode4/5 输出 A；mode3 输出 -A）
+        e_A = np.abs(inv_block - A_ref).max()
         e_negA = np.abs(inv_block - negA).max()
-        e_negAT = np.abs(inv_block - negAT).max()
-        e_zero = np.abs(inv_block).max()
         tri_low = np.abs(np.tril(inv_block, -1)).max()
         tri_up = np.abs(np.triu(inv_block, 1)).max()
-        print(f"      [MNEG diag BT={BT}] vs(-A)={e_negA:.4f}  vs(-A^T)={e_negAT:.4f}  "
-              f"maxabs={e_zero:.4f}  lowTriMax={tri_low:.4f}  upTriMax={tri_up:.4f}")
-        # 元素级非零模式（仅 BT=32），定位 MNEG 上三角垃圾的结构：
-        #   '.'≈0  '+'>0  '-'<0    左:kernel输出MNEG  右:期望 -A
+        diag_max = np.abs(np.diag(inv_block)).max()
+        print(f"      [PROBE BT={BT}] vs(A)={e_A:.4f}  vs(-A)={e_negA:.4f}  "
+              f"lowTriMax={tri_low:.4f}  upTriMax={tri_up:.4f}  diagMax={diag_max:.4f}")
+        # 元素级符号模式（仅 BT=32），右列参考用 A（mode4/5）：
         if BT == 32:
             def pat(M, thr=0.02):
-                rows = []
-                for i in range(M.shape[0]):
-                    rows.append("".join('.' if abs(v) < thr else ('+' if v > 0 else '-')
-                                        for v in M[i]))
-                return rows
-            po, pe = pat(inv_block), pat(negA)
-            print("      MNEG pattern (left=kernel out, right=-A expected):")
+                return ["".join('.' if abs(v) < thr else ('+' if v > 0 else '-') for v in M[i])
+                        for i in range(M.shape[0])]
+            po, pe = pat(inv_block), pat(A_ref)
+            print("      pattern (left=kernel out, right=A):")
             for i in range(BT):
                 print(f"        {po[i]}   {pe[i]}")
 
