@@ -109,6 +109,19 @@ def test_solve_tril_mbh(BT, layout="bhtd", dtype=torch.float16, seed=42):
         tri_up = np.abs(np.triu(inv_block, 1)).max()
         print(f"      [MNEG diag BT={BT}] vs(-A)={e_negA:.4f}  vs(-A^T)={e_negAT:.4f}  "
               f"maxabs={e_zero:.4f}  lowTriMax={tri_low:.4f}  upTriMax={tri_up:.4f}")
+        # 元素级非零模式（仅 BT=32），定位 MNEG 上三角垃圾的结构：
+        #   '.'≈0  '+'>0  '-'<0    左:kernel输出MNEG  右:期望 -A
+        if BT == 32:
+            def pat(M, thr=0.02):
+                rows = []
+                for i in range(M.shape[0]):
+                    rows.append("".join('.' if abs(v) < thr else ('+' if v > 0 else '-')
+                                        for v in M[i]))
+                return rows
+            po, pe = pat(inv_block), pat(negA)
+            print("      MNEG pattern (left=kernel out, right=-A expected):")
+            for i in range(BT):
+                print(f"        {po[i]}   {pe[i]}")
 
     # 校验 1：与 CPU golden 的最大差
     max_diff = np.abs(inv_block - golden_np).max()
