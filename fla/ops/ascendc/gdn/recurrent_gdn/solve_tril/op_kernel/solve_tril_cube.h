@@ -1051,37 +1051,36 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
         int32_t othStart = isLower_ ? 0 : 1;
 
         // step A: 提取驱动对角块 -> SLOT_Y
+        // 注：本调试路径不追求性能，每个 step 之间全量 PipeBarrier<PIPE_ALL> 强制串行，
+        //   规避本 arch 上 --cce-auto-sync=off 下多分形跨 step 的残留同步竞争
+        //   （症状：BT=32 欠计、BT=64 重复累加、BT=128 偶然正确等非确定性错误）。
+        PipeBarrier<PIPE_ALL>();
         ExtractBlocksFromGM(xSrc, SLOT_Y, blockSize, drvStart);
-        // step B: L0C = I × I = 完整单位阵（用空闲 SLOT_INPUT 暂存 I）
+        PipeBarrier<PIPE_ALL>();
+        // step B: L0C = I × I = 完整单位阵
         MatmulToL0C(SLOT_I, SLOT_I, true);
-        SetFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
-        WaitFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
-        // ★ 关键：累加前必须 PipeBarrier<PIPE_ALL>，否则下一个 Mmad(initC=false) 会在
-        //   step B 的 L0C 写回提交前启动，导致"覆盖"而非"累加"（mode8 已证）。
         PipeBarrier<PIPE_ALL>();
         // step C: Y = Y × (-A) + I（累加到 step B 的 L0C=I）
         MatmulToSlot(SLOT_Y, SLOT_MNEG, SLOT_Y, false);
+        PipeBarrier<PIPE_ALL>();
 
         // step D: 提取非驱动对角块(L11_inv 等) -> SLOT_INPUT
         ExtractBlocksFromGM(xSrc, SLOT_INPUT, blockSize, othStart);
+        PipeBarrier<PIPE_ALL>();
         // step E: L0C = Y × INPUT
         MatmulToL0C(SLOT_Y, SLOT_INPUT, true);
-        SetFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
-        WaitFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
-        SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
-        WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        PipeBarrier<PIPE_ALL>();
         // step F: 提取驱动对角块 -> SLOT_INPUT（准备累加对角逆）
         ExtractBlocksFromGM(xSrc, SLOT_INPUT, blockSize, drvStart);
-        // ★ 关键：step G 累加前同样需 PipeBarrier<PIPE_ALL>，保证 step E 的 L0C 已提交。
         PipeBarrier<PIPE_ALL>();
         // step G: L0C += I × INPUT
         MatmulToL0C(SLOT_I, SLOT_INPUT, false);
-        SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
-        WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+        PipeBarrier<PIPE_ALL>();
 
         if (blockSize < MATRIX_SIZE / 2) {
             // 层间结果 L0C -> xGM_（Fixpipe，已验证），下一层从 xGM_ 提取
             SpillL0CToXGM();
+            PipeBarrier<PIPE_ALL>();
             xSrc = xGM_;
         }
     }
