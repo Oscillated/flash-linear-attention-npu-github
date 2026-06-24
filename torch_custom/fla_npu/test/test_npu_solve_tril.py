@@ -102,15 +102,17 @@ def test_solve_tril_mbh(BT, layout="bhtd", dtype=torch.float16, seed=42):
     if os.environ.get("MBH_DIAG_MNEG") == "1":
         negA = -block_np
         A_ref = block_np
-        # 同时给出与 A 和 -A 的比较（mode4/5 输出 A；mode3 输出 -A）
+        IpA = np.eye(BT, dtype=np.float32) + block_np
+        # mode4/5/7 输出 A；mode3 输出 -A；mode6 输出 I+A
         e_A = np.abs(inv_block - A_ref).max()
         e_negA = np.abs(inv_block - negA).max()
+        e_IpA = np.abs(inv_block - IpA).max()
         tri_low = np.abs(np.tril(inv_block, -1)).max()
         tri_up = np.abs(np.triu(inv_block, 1)).max()
         diag_max = np.abs(np.diag(inv_block)).max()
-        print(f"      [PROBE BT={BT}] vs(A)={e_A:.4f}  vs(-A)={e_negA:.4f}  "
+        print(f"      [PROBE BT={BT}] vs(A)={e_A:.4f}  vs(-A)={e_negA:.4f}  vs(I+A)={e_IpA:.4f}  "
               f"lowTriMax={tri_low:.4f}  upTriMax={tri_up:.4f}  diagMax={diag_max:.4f}")
-        # 元素级符号模式（仅 BT=32），右列参考用 A（mode4/5）：
+        # 元素级符号模式（仅 BT=32），右列参考用 A：
         if BT == 32:
             def pat(M, thr=0.02):
                 return ["".join('.' if abs(v) < thr else ('+' if v > 0 else '-') for v in M[i])

@@ -449,6 +449,27 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             MatmulToL0C(SLOT_INPUT, SLOT_I, true);         // A × I
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#elif SOLVE_TRIL_MBH_PASSTHROUGH == 6
+            // 诊断6：测试 initC=false 累加路径（merge step B+C 的核心）。
+            // L0C = I×I (initC=true)，再 L0C += A×I (initC=false)。期望输出 == I + A。
+            // 若 != I+A → L0C 跨两次 matmul 的累加/保持 在本 arch 有问题。
+            LoadFullInputForMBH(gmOffset);                 // A -> SLOT_INPUT
+            MatmulToL0C(SLOT_I, SLOT_I, true);             // L0C = I
+            SetFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+            WaitFlag<HardEvent::M_MTE1>(EVT_M_MTE1);
+            MatmulToL0C(SLOT_INPUT, SLOT_I, false);        // L0C += A×I = I + A
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
+#elif SOLVE_TRIL_MBH_PASSTHROUGH == 7
+            // 诊断7：测试 MatmulToSlot 读写同槽 + L0CToSlot 回写（merge step C 的形态）。
+            // 先 SLOT_INPUT=A；SLOT_Y<-A 的拷贝经 matmul：MatmulToSlot(SLOT_INPUT,SLOT_I,SLOT_Y)
+            // 即 SLOT_Y = A×I = A（经 L0CToSlot 回写）；再 MatmulToL0C(SLOT_Y,SLOT_I) 输出。
+            // 期望 == A。若 != A → L0CToSlot 回写丢失非对角块。
+            LoadFullInputForMBH(gmOffset);                 // A -> SLOT_INPUT
+            MatmulToSlot(SLOT_INPUT, SLOT_I, SLOT_Y, true);// SLOT_Y = A (经 L0C->scratch->L1)
+            MatmulToL0C(SLOT_Y, SLOT_I, true);             // 输出 SLOT_Y
+            SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
+            WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
 #else
             LoadFullInputForMBH(gmOffset);
             RecursiveMerge();
