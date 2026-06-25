@@ -53,7 +53,7 @@ private:
     __aicore__ inline void GenerateAuxMatrices();
 #if SOLVE_TRIL_MBH_UB_OPT
     // UB 优化（AIV 侧）：MCH 输出 GM->UB(nd2nz) 暂存；每层把 xUB_ 的 drv/oth 块清零+提取到 L1。
-    __aicore__ inline void CooperateMergeOneTile();
+    __aicore__ inline void CooperateMergeOneTile(int32_t subIdx);
     __aicore__ inline void ExtractFromUB(int32_t dstSlot, int32_t blockSize, int32_t startBlock);
     __aicore__ inline void ClearSlotUB(int32_t slot);
 #endif
@@ -80,8 +80,9 @@ private:
 
     Catlass::Arch::CrossCoreFlagWithReverse<> flagAivFinish_{SYNC_AIV_AIC_FLAG_SOLVE, SYNC_AIC_AIV_FLAG_SOLVE};
 #if SOLVE_TRIL_MBH_UB_OPT
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady_{UBOPT_FLAG_AIC_READY};  // AIC -> AIV
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady_{UBOPT_FLAG_AIV_READY};  // AIV -> AIC
+    Catlass::Arch::CrossCoreFlag ubFlagAicReady_{UBOPT_FLAG_AIC_READY};       // AIC -> 两 subcore
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};    // AIV sub0 -> AIC
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};    // AIV sub1 -> AIC
 #endif
 };
 
@@ -124,20 +125,25 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
     SyncAll<false>();   // 所有 AIV 核各调用一次（与既有结构一致）
 
 #if SOLVE_TRIL_MBH_UB_OPT
-    // UB 协作：仅 sub0；仅 MATRIX_SIZE>FRAC（BT>16 才有 MBH 递归）；仅本组非空闲（与 cube 一致）。
-    if (subIdx != 0) return;
+    // UB 协作：仅 MATRIX_SIZE>FRAC（BT>16 才有 MBH 递归）；仅本组非空闲（与 cube 一致）。
+    // 关键（1:2 MIX 的 FFTS 跨核计数，见 common.h）：AIC 一次 Set(aicReady) 扇出给两 subcore 各 +1；
+    //   两 subcore 各 Set 自己的 aivReady0/1，AIC 各 Wait 一次。故两个 subcore 都必须进入握手循环、
+    //   调用相同次数的 Wait(aicReady)/Set(aivReady[sub])，否则计数失衡 -> AIC 永久等待 -> 死锁（超时）。
+    //   实际 GM->UB 暂存与 UB<->L1 搬运只让 sub0 做；sub1 只陪跑握手。
     if constexpr (MATRIX_SIZE > 16) {
-        // 清零 zeroUB_（一次），供后续清 L1 槽用
-        Duplicate(zeroUB_, half(0), TILE_LEN);
-        SetFlag<HardEvent::V_MTE3>(0);
-        WaitFlag<HardEvent::V_MTE3>(0);
+        if (subIdx == 0) {
+            // 清零 zeroUB_（一次），供后续清 L1 槽用（仅 sub0 做数据搬运）
+            Duplicate(zeroUB_, half(0), TILE_LEN);
+            SetFlag<HardEvent::V_MTE3>(0);
+            WaitFlag<HardEvent::V_MTE3>(0);
+        }
 
         int64_t startTile = static_cast<int64_t>(blockIdx) * tilesPerCore_;
         int64_t endTile = startTile + tilesPerCore_;
         if (endTile > totalTiles_) endTile = totalTiles_;
-        if (startTile >= totalTiles_) return;
+        if (startTile >= totalTiles_) return;   // 空闲 block：两 subcore 都不进握手（与 cube 对称）
         for (int64_t t = startTile; t < endTile; t++) {
-            CooperateMergeOneTile();
+            CooperateMergeOneTile(subIdx);
         }
     }
 #endif
@@ -145,40 +151,49 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
 
 #if SOLVE_TRIL_MBH_UB_OPT
 template <int MATRIX_SIZE>
-__aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile()
+__aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32_t subIdx)
 {
     int32_t drvStart = isLower_ ? 1 : 0;
     int32_t othStart = isLower_ ? 0 : 1;
 
-    // task2：MCH 输出 GM(ND) -> xUB_(UB, NZ)（GM->UB nd2nz；mch_out 为独立 BT×BT，读基址）
-    Nd2NzParams nd2nzParams;
-    nd2nzParams.ndNum = 1;
-    nd2nzParams.nValue = static_cast<uint32_t>(MATRIX_SIZE);
-    nd2nzParams.dValue = static_cast<uint32_t>(MATRIX_SIZE);
-    nd2nzParams.srcDValue = MATRIX_SIZE;
-    nd2nzParams.srcNdMatrixStride = 0;
-    nd2nzParams.dstNzNStride = 1;
-    nd2nzParams.dstNzC0Stride = MATRIX_SIZE;
-    nd2nzParams.dstNzMatrixStride = 0;
-    DataCopy(xUB_, mchOutGM_, nd2nzParams);
-    PipeBarrier<PIPE_ALL>();
+    // task2：MCH 输出 GM(ND) -> xUB_(UB, NZ)（GM->UB nd2nz）。仅 sub0 做数据搬运；sub1 只陪跑握手。
+    if (subIdx == 0) {
+        Nd2NzParams nd2nzParams;
+        nd2nzParams.ndNum = 1;
+        nd2nzParams.nValue = static_cast<uint32_t>(MATRIX_SIZE);
+        nd2nzParams.dValue = static_cast<uint32_t>(MATRIX_SIZE);
+        nd2nzParams.srcDValue = MATRIX_SIZE;
+        nd2nzParams.srcNdMatrixStride = 0;
+        nd2nzParams.dstNzNStride = 1;
+        nd2nzParams.dstNzC0Stride = MATRIX_SIZE;
+        nd2nzParams.dstNzMatrixStride = 0;
+        DataCopy(xUB_, mchOutGM_, nd2nzParams);
+        PipeBarrier<PIPE_ALL>();
+    }
 
-    // 与 cube RecursiveMerge 的层循环一一对应（每层 1 次握手）。
+    // 与 cube RecursiveMerge 的层循环一一对应（每层 1 次握手）。两 subcore 都进循环、
+    // 调用相同次数的 Wait(aicReady)/Set(aivReady)，以平衡 1:2 MIX 的 FFTS 跨核计数（见 Process 注释）。
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
         // 等 AIC：常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)
         Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady_);
         PipeBarrier<PIPE_ALL>();
 
-        // 清 L1 提取目标槽（zeroUB->L1），再写选中分形（xUB->L1，raw）。全部 UB->L1，在 AIV。
-        ClearSlotUB(SLOT_X);
-        ClearSlotUB(SLOT_INPUT);
-        PipeBarrier<PIPE_ALL>();
-        ExtractFromUB(SLOT_X, blockSize, drvStart);
-        ExtractFromUB(SLOT_INPUT, blockSize, othStart);
-        PipeBarrier<PIPE_ALL>();
+        if (subIdx == 0) {
+            // 清 L1 提取目标槽（zeroUB->L1），再写选中分形（xUB->L1，raw）。全部 UB->L1，在 AIV sub0。
+            ClearSlotUB(SLOT_X);
+            ClearSlotUB(SLOT_INPUT);
+            PipeBarrier<PIPE_ALL>();
+            ExtractFromUB(SLOT_X, blockSize, drvStart);
+            ExtractFromUB(SLOT_INPUT, blockSize, othStart);
+            PipeBarrier<PIPE_ALL>();
+        }
 
-        // 通知 AIC：drv/oth 已提取到 L1，可做 Mmad
-        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(ubFlagAivReady_);
+        // 通知 AIC：本 subcore 已就绪。每 subcore Set 自己的 flag（1:2 MIX FFTS 计数要求）。
+        if (subIdx == 0) {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(ubFlagAivReady0_);
+        } else {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(ubFlagAivReady1_);
+        }
     }
 }
 

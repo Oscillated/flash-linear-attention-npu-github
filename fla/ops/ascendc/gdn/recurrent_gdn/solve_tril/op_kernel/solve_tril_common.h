@@ -69,13 +69,23 @@ constexpr uint64_t DIAG_MASK_8X16_EVEN[2] = {
 };
 
 #if SOLVE_TRIL_MBH_UB_OPT
-// UB 优化的 AIC<->AIV 跨核同步 flag（每层 2 次握手）：
-//   - UBOPT_FLAG_AIC_READY：AIC -> AIV。含义“常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)，可提取”。
-//   - UBOPT_FLAG_AIV_READY：AIV -> AIC。含义“本层 drv/oth 块已 raw UB->L1 提取到 L1，可做 Mmad”。
-// id 避开 catlass 预留(7~10) 与既有 aux-gen 用的 3/5；用 CrossCoreFlag（无 reverse，
-// 单 tile/核、每 flag set 次数<=层数<=3，远小于硬件 15 上限）。
-constexpr uint16_t UBOPT_FLAG_AIC_READY = 11;
-constexpr uint16_t UBOPT_FLAG_AIV_READY = 12;
+// UB 优化的 AIC<->AIV 跨核同步 flag。1:2 MIX 下 FFTS 计数语义（已查 SDK 与参考算子证实）：
+//   - mode 0x2 的 CrossCoreSetFlag 是【按 AIV subcore 扇出】：AIC 一次 Set 给【两个 subcore】各 +1；
+//     每个 subcore 一次 Set 只给 AIC +1。每个 CrossCoreWaitFlag 消费(−1)一个计数。
+//   - 故方向 1->2（AIC->AIV）：用【1 个 flag、AIC Set 1 次】即可让两个 subcore 各 Wait 1 次满足。
+//     方向 2->1（AIV->AIC）：必须【每 subcore 一个独立 flag】，两 subcore 各 Set 自己的，AIC 各 Wait 一次。
+//     （之前两 subcore 共用一个 aivReady、AIC 只 Wait 一次 -> 计数泄漏 -> ≤15 次后冻结。参考算子
+//      chunk_gated_delta_rule_fwd_h 即用 vec2Done[2]={3,4} 两个 flag、cube 等两次。）
+//   - cube 侧 Set 必须用 cube pipe（PIPE_FIX/PIPE_MTE2/PIPE_MTE1/PIPE_M）；AIV 侧用 vector pipe
+//     （PIPE_MTE3 等）。cube 用 PIPE_MTE3 会编译成空操作（MTE3 非 cube pipe）-> 必死锁。
+// 含义：
+//   - UBOPT_FLAG_AIC_READY：AIC -> 两 AIV subcore。“常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)”。
+//   - UBOPT_FLAG_AIV_READY_0/1：AIV subcore0/1 -> AIC。“本层 drv/oth 已提取到 L1，可做 Mmad”。
+// 【flag id 选择】避开：aux-gen 握手 SYNC_*_FLAG_SOLVE=3/5；catlass barrier 预留 7~10；
+//   SDK SyncAll 占用 11/12/13/14（dav_3510 sync_impl.h）。用低位空闲 id 0/1/2。
+constexpr uint16_t UBOPT_FLAG_AIC_READY   = 0;  // AIC -> 两 subcore（单 flag 扇出）
+constexpr uint16_t UBOPT_FLAG_AIV_READY_0 = 1;  // AIV subcore0 -> AIC
+constexpr uint16_t UBOPT_FLAG_AIV_READY_1 = 2;  // AIV subcore1 -> AIC
 #endif
 #endif
 
