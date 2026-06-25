@@ -232,11 +232,11 @@ private:
     Catlass::Arch::CrossCoreFlagWithReverse<> flagAivFinish_{SYNC_AIC_AIV_FLAG_SOLVE, SYNC_AIV_AIC_FLAG_SOLVE};
 #endif
 #if SOLVE_TRIL_MBH_UB_OPT
-    // UB 优化跨核握手（AIC<->AIV，两核以相同 id 构造 -> 同一硬件 flag）。
-    // aivReady 每 subcore 一个独立 flag（1:2 MIX 的 FFTS 计数要求，见 common.h）。
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady_{UBOPT_FLAG_AIC_READY};       // AIC -> 两 subcore
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};    // AIV sub0 -> AIC
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};    // AIV sub1 -> AIC
+    // UB 优化跨核握手（全点对点，每 flag 1 setter/1 waiter；见 common.h 死锁根因说明）。
+    Catlass::Arch::CrossCoreFlag ubFlagAicReady0_{UBOPT_FLAG_AIC_READY_0};   // AIC -> AIV sub0
+    Catlass::Arch::CrossCoreFlag ubFlagAicReady1_{UBOPT_FLAG_AIC_READY_1};   // AIC -> AIV sub1
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};   // AIV sub0 -> AIC
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};   // AIV sub1 -> AIC
 #endif
 };
 
@@ -1160,12 +1160,11 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
     //   AIC SetFlag(AicReady)：常量就绪(L0)/本层结果已写回 xUB_(L>=1) -> AIV 可提取；
     //   AIC WaitFlag(AivReady)：AIV 已把 drv->SLOT_X、oth->SLOT_INPUT 提取到 L1 -> 可 Mmad。
     // 握手（1:2 MIX FFTS 计数，见 common.h）：
-    //   AIC Set(aicReady) 1 次 -> 扇出给两 subcore 各 +1，两 subcore 各 Wait 1 次满足。
-    //   两 subcore 各 Set 自己的 aivReady0/1 -> AIC 每层各 Wait 一次（共 2 次）。
-    //   计数：每 tile AIC aicReady Set = 层数 L（1 初始 + (L-1) spill）；aivReady{0,1} 各 Wait = L。
-    //   两 subcore 各 aicReady Wait = L、aivReady{0,1} Set = L。全部配平。
+    //   全点对点（每 flag 1 setter/1 waiter，见 common.h）：AIC 对 aicReady0/1 各 Set；
+    //   等 aivReady0/1 各 Wait。每 tile：aicReady_s Set = L（1 初始 + (L-1) spill），aivReady_s Wait = L。
     PipeBarrier<PIPE_ALL>();
-    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(ubFlagAicReady_);  // 常量就绪 -> 两 subcore
+    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(ubFlagAicReady0_);  // 常量就绪 -> sub0
+    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(ubFlagAicReady1_);  // 常量就绪 -> sub1
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
         bool lastLevel = !(blockSize < MATRIX_SIZE / 2);
 
@@ -1195,7 +1194,8 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
             SpillL0CToUB();
             PipeBarrier<PIPE_ALL>();
 #endif
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ubFlagAicReady_);
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ubFlagAicReady0_);
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ubFlagAicReady1_);
         }
         // lastLevel：结果留在 L0C，由 ProcessOneTile 的 StoreFinalResult 写出。
     }

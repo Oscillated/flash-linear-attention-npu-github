@@ -91,21 +91,17 @@ constexpr uint64_t DIAG_MASK_8X16_EVEN[2] = {
 };
 
 #if SOLVE_TRIL_MBH_UB_OPT
-// UB 优化的 AIC<->AIV 跨核同步 flag。1:2 MIX 下 FFTS 计数语义（已查 SDK 与参考算子证实）：
-//   - mode 0x2 的 CrossCoreSetFlag 是【按 AIV subcore 扇出】：AIC 一次 Set 给【两个 subcore】各 +1；
-//     每个 subcore 一次 Set 只给 AIC +1。每个 CrossCoreWaitFlag 消费(−1)一个计数。
-//   - 故方向 1->2（AIC->AIV）：用【1 个 flag、AIC Set 1 次】即可让两个 subcore 各 Wait 1 次满足。
-//     方向 2->1（AIV->AIC）：必须【每 subcore 一个独立 flag】，两 subcore 各 Set 自己的，AIC 各 Wait 一次。
-//     （之前两 subcore 共用一个 aivReady、AIC 只 Wait 一次 -> 计数泄漏 -> ≤15 次后冻结。参考算子
-//      chunk_gated_delta_rule_fwd_h 即用 vec2Done[2]={3,4} 两个 flag、cube 等两次。）
-//   - cube 侧 Set 必须用 cube pipe（PIPE_FIX/PIPE_MTE2/PIPE_MTE1/PIPE_M）；AIV 侧用 vector pipe
-//     （PIPE_MTE3 等）。cube 用 PIPE_MTE3 会编译成空操作（MTE3 非 cube pipe）-> 必死锁。
-// 含义：
-//   - UBOPT_FLAG_AIC_READY：AIC -> 两 AIV subcore。“常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)”。
-//   - UBOPT_FLAG_AIV_READY_0/1：AIV subcore0/1 -> AIC。“本层 drv/oth 已提取到 L1，可做 Mmad”。
-// 【flag id 选择】避开：aux-gen 握手 SYNC_*_FLAG_SOLVE=3/5；catlass barrier 预留 7~10；
-//   SDK SyncAll 占用 11/12/13/14（dav_3510 sync_impl.h）。用低位空闲 id 0/1/2。
-constexpr uint16_t UBOPT_FLAG_AIC_READY   = 0;  // AIC -> 两 subcore（单 flag 扇出）
+// UB 优化的 AIC<->AIV 跨核同步 flag —— 全点对点（每个 flag 恰好 1 个 producer + 1 个 consumer）。
+// 【为什么必须点对点（DIAG=7 裸握手实测死锁的根因）】：1:2 MIX 下 FFTS flag 计数器是
+//   【两个 subcore 共享】的（不是每 subcore 独立）。若两个 subcore 等同一个 aicReady id、AIC 只 Set 一次：
+//   计数器=1，sub0 Wait 消费归 0，sub1 Wait 永久阻塞 -> 死锁。故 AIC->AIV 也必须每 subcore 一个独立
+//   flag id、AIC 对两个 id 各 Set 一次。这样每个 flag 严格 1 setter/1 waiter，set 次数==wait 次数，
+//   与扇出/广播语义无关，恒不死锁。（参考算子 vec2Done[2]={3,4} 即是“每路一个独立 id”，非共享单 id。）
+//   方向均如此：AIC->sub_s 用 aicReady_s；sub_s->AIC 用 aivReady_s。
+// cube 侧 Set 用 cube pipe（PIPE_FIX/PIPE_MTE2）；AIV 侧用 vector pipe（PIPE_MTE3）。
+// 【flag id】避开 aux-gen SYNC_*_FLAG_SOLVE=3/5、catlass barrier 7~10、SyncAll 11~14。用 0/1/2/4。
+constexpr uint16_t UBOPT_FLAG_AIC_READY_0 = 0;  // AIC -> AIV subcore0
+constexpr uint16_t UBOPT_FLAG_AIC_READY_1 = 4;  // AIC -> AIV subcore1
 constexpr uint16_t UBOPT_FLAG_AIV_READY_0 = 1;  // AIV subcore0 -> AIC
 constexpr uint16_t UBOPT_FLAG_AIV_READY_1 = 2;  // AIV subcore1 -> AIC
 #endif

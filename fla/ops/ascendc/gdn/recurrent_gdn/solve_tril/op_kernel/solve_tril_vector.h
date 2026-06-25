@@ -88,9 +88,10 @@ private:
 
     Catlass::Arch::CrossCoreFlagWithReverse<> flagAivFinish_{SYNC_AIV_AIC_FLAG_SOLVE, SYNC_AIC_AIV_FLAG_SOLVE};
 #if SOLVE_TRIL_MBH_UB_OPT
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady_{UBOPT_FLAG_AIC_READY};       // AIC -> 两 subcore
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};    // AIV sub0 -> AIC
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};    // AIV sub1 -> AIC
+    Catlass::Arch::CrossCoreFlag ubFlagAicReady0_{UBOPT_FLAG_AIC_READY_0};   // AIC -> AIV sub0
+    Catlass::Arch::CrossCoreFlag ubFlagAicReady1_{UBOPT_FLAG_AIC_READY_1};   // AIC -> AIV sub1
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};   // AIV sub0 -> AIC
+    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};   // AIV sub1 -> AIC
 #endif
 };
 
@@ -194,8 +195,12 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
     // 与 cube RecursiveMerge 的层循环一一对应（每层 1 次握手）。两 subcore 都进循环、
     // 调用相同次数的 Wait(aicReady)/Set(aivReady)，以平衡 1:2 MIX 的 FFTS 跨核计数（见 Process 注释）。
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
-        // 等 AIC：常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)
-        Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady_);
+        // 等 AIC：常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)。每 subcore 等自己的 aicReady_s。
+        if (subIdx == 0) {
+            Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady0_);
+        } else {
+            Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady1_);
+        }
         PipeBarrier<PIPE_ALL>();
 
 #if SOLVE_TRIL_UBOPT_DIAG != 7
