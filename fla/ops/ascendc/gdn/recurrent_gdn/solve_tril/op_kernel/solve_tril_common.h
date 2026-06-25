@@ -35,6 +35,11 @@
 //   =2：执行到 SyncAll 之后 return（cube：SyncAll 后；vector：aux-gen+SyncAll 后）。
 //       若 =1 完成而 =2 卡死 -> 卡在 SyncAll/aux-gen；若 =2 完成 -> 卡在 SyncAll 之后（PrepareConstants/compute）。
 //   =3：cube 执行到 PrepareConstants 之后 return。隔离 PrepareConstants vs tile 计算。
+//   （已确认 =1/=2/=3 均不超时 -> 卡死在 tile 计算 ProcessOneTile 内，且 BT=16 无跨核协作->纯 cube 单核）
+//   =4：ProcessOneTile 中 staging(BT=16 的 LoadMchOutToSlotX) 之后 return；BT>16 跳过 RecursiveMerge，
+//       AIV(DIAG>=2) 不协作。隔离 LoadMchOutToSlotX。
+//   =5：BT=16 做完 matmul 后、StoreFinalResult 前 return；BT>16 同样跳过 RecursiveMerge。隔离 matmul。
+//       =4 完成且 =5 卡 -> matmul；=5 完成 -> 卡在 StoreFinalResult；=4 卡 -> LoadMchOutToSlotX。
 //   =0：完整执行。定位完成后移除本探针。
 #ifndef SOLVE_TRIL_UBOPT_DIAG
 #define SOLVE_TRIL_UBOPT_DIAG 0

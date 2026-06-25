@@ -479,6 +479,10 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
         MCHInvertDiagonal();
 #endif
 
+#if SOLVE_TRIL_UBOPT_DIAG == 4
+        return;   // 探针L4：staging(BT=16 的 LoadMchOutToSlotX) 后返回，隔离 LoadMchOutToSlotX
+#endif
+
         if constexpr (MATRIX_SIZE > FRAC) {
 #if SOLVE_TRIL_MBH_PASSTHROUGH == 1
             // 诊断1：跳过 MBH，仅 X×I 写回，验证多分形 matmul + 写回（应得 mch_out）
@@ -546,8 +550,13 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
 #else
+#if SOLVE_TRIL_UBOPT_DIAG >= 4
+            // 探针L4+：BT>16 跳过 RecursiveMerge（AIV 此时已早退不协作，cube 若跑 RecursiveMerge
+            // 会等不到 aivReady 而死锁）。定位仅依赖 BT=16 单核路径。
+#else
             LoadFullInputForMBH(gmOffset);
             RecursiveMerge();
+#endif
 #endif
         } else {
 #if SOLVE_TRIL_PLATFORM_ASCEND950
@@ -559,6 +568,9 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
         }
+#if SOLVE_TRIL_UBOPT_DIAG == 5
+        return;   // 探针L5：matmul(BT=16) / RecursiveMerge 后、StoreFinalResult 前返回，隔离 matmul
+#endif
         StoreFinalResult(gmOffset);
     }
 }

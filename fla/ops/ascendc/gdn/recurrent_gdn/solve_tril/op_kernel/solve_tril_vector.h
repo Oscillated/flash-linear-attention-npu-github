@@ -138,8 +138,8 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
         GenerateAuxMatrices();
     }
     SyncAll<false>();   // 所有 AIV 核各调用一次（与既有结构一致）
-#if SOLVE_TRIL_UBOPT_DIAG == 2 || SOLVE_TRIL_UBOPT_DIAG == 3
-    return;   // 探针L2/L3：aux-gen+SyncAll 后返回（vector 无 PrepareConstants）
+#if SOLVE_TRIL_UBOPT_DIAG >= 2
+    return;   // 探针L2+：aux-gen+SyncAll 后返回（vector 不参与协作，避免与 cube 早退失配死锁）
 #endif
 
 #if SOLVE_TRIL_MBH_UB_OPT
