@@ -144,11 +144,13 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
 #endif
 
 #if SOLVE_TRIL_MBH_UB_OPT
-    // UB 协作：仅 MATRIX_SIZE>FRAC（BT>16 才有 MBH 递归）；仅本组非空闲（与 cube 一致）。
-    // 关键（1:2 MIX 的 FFTS 跨核计数，见 common.h）：AIC 一次 Set(aicReady) 扇出给两 subcore 各 +1；
-    //   两 subcore 各 Set 自己的 aivReady0/1，AIC 各 Wait 一次。故两个 subcore 都必须进入握手循环、
-    //   调用相同次数的 Wait(aicReady)/Set(aivReady[sub])，否则计数失衡 -> AIC 永久等待 -> 死锁（超时）。
-    //   实际 GM->UB 暂存与 UB<->L1 搬运只让 sub0 做；sub1 只陪跑握手。
+    // UB 协作：仅 MATRIX_SIZE>FRAC（BT>16 才有 MBH 递归）。跨核同步用 SyncAll<false> 全局屏障，
+    // 要求【每个 launched 核（AIC + 全部 AIV subcore）调用 SyncAll 次数完全一致】，否则全局屏障死锁。
+    // 【关键修复】此前用 startTile=GetBlockIdx()*tilesPerCore 的守卫：AIV 上 GetBlockIdx() 的语义
+    //   （可能是 per-subcore / AIV-global 索引）会让某些 subcore 算出 startTile>=totalTiles 而提前 return，
+    //   跳过协作 SyncAll -> AIC 在屏障处永久等待 -> 死锁（这正是多轮超时的真因）。
+    //   修法：两个 subcore 都遍历 [0,totalTiles_) 全部 tile（单核测试下与 AIC 的 [0,totalTiles) 一致）。
+    //   注：仅适用单核(usedCoreNum=1)调试；多核需按 (AIC,其AIV) 配对的块索引重做，届时再处理。
     if constexpr (MATRIX_SIZE > 16) {
         if (subIdx == 0) {
             // 清零 zeroUB_（一次），供后续清 L1 槽用（仅 sub0 做数据搬运）
@@ -157,11 +159,7 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
             WaitFlag<HardEvent::V_MTE3>(0);
         }
 
-        int64_t startTile = static_cast<int64_t>(blockIdx) * tilesPerCore_;
-        int64_t endTile = startTile + tilesPerCore_;
-        if (endTile > totalTiles_) endTile = totalTiles_;
-        if (startTile >= totalTiles_) return;   // 空闲 block：两 subcore 都不进握手（与 cube 对称）
-        for (int64_t t = startTile; t < endTile; t++) {
+        for (int64_t t = 0; t < totalTiles_; t++) {
             CooperateMergeOneTile(subIdx);
         }
     }
