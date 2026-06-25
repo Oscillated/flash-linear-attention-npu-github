@@ -9,6 +9,8 @@
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 #include "catlass/arch/cross_core_sync.hpp"
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
 
 // 内联 l0c_to_gm：L0C -> GM (NZ→ND, FP32→FP16)
 namespace NsSolveTril {
@@ -92,7 +94,11 @@ public:
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
                                 GM_ADDR mch_out, GM_ADDR zero_mat, GM_ADDR eye_mat,
                                 GM_ADDR x_out, GM_ADDR workspace,
-                                const SolveTrilTilingData* tilingData);
+                                const SolveTrilTilingData* tilingData
+#if SOLVE_TRIL_MBH_UB_OPT
+                                , Catlass::Arch::Resource<Catlass::Arch::Ascend950>* res
+#endif
+                                );
     __aicore__ inline void Process();
 
 private:
@@ -144,7 +150,9 @@ private:
     __aicore__ inline void ClearSlot(int32_t slot);
 
 private:
+#if !SOLVE_TRIL_MBH_UB_OPT
     TPipe pipe_;
+#endif
     GlobalTensor<half> inputGM_;
     GlobalTensor<half> outputGM_;
     GlobalTensor<half> workspaceGM_;
@@ -182,12 +190,15 @@ private:
     GlobalTensor<half> xGM_;
 #endif
 #if SOLVE_TRIL_MBH_UB_OPT
-    // arch3510 UB 优化：X 的 UB 常驻副本（NZ）。AIC 经 Fixpipe 写（SpillL0CToUB），
-    // AIV 读（提取）/写（GM->UB 暂存）。须与 AIV 的 xUB_ 同物理偏移（各 TPipe 内首个 VECCALC）。
-    TBuf<TPosition::VECCALC> xUbBuf_;
-    LocalTensor<half> xUB_;
-#endif
-
+    // arch3510 UB 优化：所有 L1/L0/UB 缓冲来自单个共享 Catlass::Arch::Resource
+    //（在 solve_tril.cpp 构造一次、其 ctor 经 pipe.Destroy() 去除 TPipe 隐式同步），
+    // AIC/AIV 用相同 GetBufferByByte 偏移 -> L1/UB 物理共享。这里只持有 LocalTensor 句柄。
+    LocalTensor<half> l1_;
+    LocalTensor<half> l0a_;
+    LocalTensor<half> l0b_;
+    LocalTensor<float> l0c_;
+    LocalTensor<half> xUB_;   // X 常驻 UB(NZ)，AIC Fixpipe 写、AIV 读
+#else
     TBuf<TPosition::A1> l1Buf_;
     LocalTensor<half> l1_;
     TBuf<TPosition::A2> l0aBuf_;
@@ -196,6 +207,7 @@ private:
     LocalTensor<half> l0b_;
     TBuf<TPosition::CO1> l0cBuf_;
     LocalTensor<float> l0c_;
+#endif
 #endif
 
     int64_t totalTiles_;
@@ -236,7 +248,11 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
     GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
     GM_ADDR mch_out, GM_ADDR zero_mat, GM_ADDR eye_mat,
     GM_ADDR x_out, GM_ADDR workspace,
-    const SolveTrilTilingData* tilingData)
+    const SolveTrilTilingData* tilingData
+#if SOLVE_TRIL_MBH_UB_OPT
+    , Catlass::Arch::Resource<Catlass::Arch::Ascend950>* res
+#endif
+    )
 {
     totalTiles_ = tilingData->totalTiles;
     matrixSize_ = tilingData->matrixSize;
@@ -309,10 +325,14 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
 #endif
 
 #if SOLVE_TRIL_MBH_UB_OPT
-    // 关键：xUbBuf_ 必须是本 TPipe 内首个 VECCALC 分配 -> 物理偏移 0，与 AIV 的 xUB_ 对齐。
-    pipe_.InitBuffer(xUbBuf_, TILE_LEN * sizeof(half));
-    xUB_ = xUbBuf_.Get<half>();
-#endif
+    // 来自共享 Resource：各缓冲取所属池偏移 0；xUB_ 取 UB 池偏移 0（AIC/AIV 一致 -> 物理共享）。
+    // 不再使用私有 TPipe（已移除 pipe_ 成员）——避免两核 TPipe 隐式同步不匹配导致的 setup 死锁。
+    l1_  = res->l1Buf.template GetBufferByByte<half>(0);
+    l0a_ = res->l0ABuf.template GetBufferByByte<half>(0);
+    l0b_ = res->l0BBuf.template GetBufferByByte<half>(0);
+    l0c_ = res->l0CBuf.template GetBufferByByte<float>(0);
+    xUB_ = res->ubBuf.template GetBufferByByte<half>(0);
+#else
     pipe_.InitBuffer(l1Buf_, L1_TOTAL_ELEMS * sizeof(half));
     l1_ = l1Buf_.Get<half>();
     pipe_.InitBuffer(l0aBuf_, TILE_LEN * sizeof(half));
@@ -321,6 +341,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
     l0b_ = l0bBuf_.Get<half>();
     pipe_.InitBuffer(l0cBuf_, TILE_LEN * sizeof(float));
     l0c_ = l0cBuf_.Get<float>();
+#endif
 #endif
 }
 

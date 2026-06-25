@@ -30,22 +30,32 @@ extern "C" __global__ __aicore__ void solve_tril(GM_ADDR x, GM_ADDR cu_seqlens, 
         int64_t tilesPerCore = tilingData.tilesPerCore;
         int64_t isLower = tilingData.isLower;
 
+#if SOLVE_TRIL_MBH_UB_OPT
+        // UB 优化：单个共享 Resource（一个 TPipe，ctor 经 pipe.Destroy() 去隐式同步）。
+        // 在 AIC/AIV 分支之前构造一次（每核各自构造，但用相同 GetBufferByByte 偏移 -> L1/UB 物理共享）。
+        // 这是仓库内唯一验证可用的跨核 on-chip L1/UB 共享模式（参考 chunk_gated_delta_rule_fwd_h）。
+        Catlass::Arch::Resource<Catlass::Arch::Ascend950> resource;
+#define UBOPT_RES_ARG , &resource
+#else
+#define UBOPT_RES_ARG
+#endif
+
         if ASCEND_IS_AIC {
             if (ms == 16) {
                 NsSolveTril::SolveTrilCube<16> op;
-                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 32) {
                 NsSolveTril::SolveTrilCube<32> op;
-                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 64) {
                 NsSolveTril::SolveTrilCube<64> op;
-                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 128) {
                 NsSolveTril::SolveTrilCube<128> op;
-                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData);
+                op.Init(x, cu_seqlens, chunk_indices, mch_out, zero_mat, eye_mat, x_out, workspace, &tilingData UBOPT_RES_ARG);
                 op.Process();
             }
         }
@@ -54,22 +64,23 @@ extern "C" __global__ __aicore__ void solve_tril(GM_ADDR x, GM_ADDR cu_seqlens, 
         if ASCEND_IS_AIV {
             if (ms == 16) {
                 NsSolveTril::SolveTrilVector<16> op;
-                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower);
+                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 32) {
                 NsSolveTril::SolveTrilVector<32> op;
-                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower);
+                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 64) {
                 NsSolveTril::SolveTrilVector<64> op;
-                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower);
+                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower UBOPT_RES_ARG);
                 op.Process();
             } else if (ms == 128) {
                 NsSolveTril::SolveTrilVector<128> op;
-                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower);
+                op.Init(workspace, mch_out, totalTiles, ms, tilesPerCore, isLower UBOPT_RES_ARG);
                 op.Process();
             }
         }
 #endif
+#undef UBOPT_RES_ARG
     }
 }

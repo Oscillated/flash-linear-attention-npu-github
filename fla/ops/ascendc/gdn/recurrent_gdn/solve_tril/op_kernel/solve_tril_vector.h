@@ -8,6 +8,8 @@
 
 #include "kernel_operator.h"
 #include "catlass/arch/cross_core_sync.hpp"
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
 #include "solve_tril_common.h"
 
 #if SOLVE_TRIL_PLATFORM_ASCEND950
@@ -46,7 +48,11 @@ public:
                                  int64_t totalTiles,
                                  int64_t matrixSize,
                                  int64_t tilesPerCore,
-                                 int64_t isLower);
+                                 int64_t isLower
+#if SOLVE_TRIL_MBH_UB_OPT
+                                 , Catlass::Arch::Resource<Catlass::Arch::Ascend950>* res
+#endif
+                                 );
     __aicore__ inline void Process();
 
 private:
@@ -58,20 +64,22 @@ private:
     __aicore__ inline void ClearSlotUB(int32_t slot);
 #endif
 
+#if !SOLVE_TRIL_MBH_UB_OPT
     TPipe pipe_;
+#endif
     GlobalTensor<half> workspaceGM_;
 #if SOLVE_TRIL_MBH_UB_OPT
+    // 缓冲来自单个共享 Catlass::Arch::Resource（见 cube/solve_tril.cpp）；只持有 LocalTensor 句柄，
+    // 与 AIC 用相同 GetBufferByByte 偏移 -> L1/UB 物理共享。无私有 TPipe（避免隐式同步死锁）。
     GlobalTensor<half> mchOutGM_;
-    // 与 cube 共享：xUB_(VECCALC) 与 l1_(A1) 须各为本核 TPipe 内首个同位分配 -> 物理偏移 0 对齐 cube。
-    TBuf<TPosition::VECCALC> xUbBuf_;
-    LocalTensor<half> xUB_;
-    TBuf<TPosition::A1> l1Buf_;
-    LocalTensor<half> l1_;
-    TBuf<TPosition::VECCALC> zeroUbBuf_;   // 清 L1 槽用（zeroUB->L1，raw），分配在 xUbBuf_ 之后
-    LocalTensor<half> zeroUB_;
-#endif
+    LocalTensor<half> xUB_;      // UB 池偏移 0，与 AIC 对齐
+    LocalTensor<half> l1_;       // L1 池偏移 0，与 AIC 对齐
+    LocalTensor<half> zeroUB_;   // UB 池偏移 TILE_LEN（清 L1 槽用）
+    LocalTensor<half> ub_;       // UB 池偏移 2*TILE_LEN（aux-gen 用）
+#else
     TBuf<TPosition::VECCALC> ubBuf_;
     LocalTensor<half> ub_;
+#endif
 
     int64_t totalTiles_;
     int64_t matrixSize_;
@@ -89,7 +97,11 @@ private:
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Init(
     GM_ADDR workspace, GM_ADDR mch_out, int64_t totalTiles, int64_t matrixSize,
-    int64_t tilesPerCore, int64_t isLower)
+    int64_t tilesPerCore, int64_t isLower
+#if SOLVE_TRIL_MBH_UB_OPT
+    , Catlass::Arch::Resource<Catlass::Arch::Ascend950>* res
+#endif
+    )
 {
     totalTiles_ = totalTiles;
     matrixSize_ = matrixSize;
@@ -100,16 +112,16 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Init(
 
 #if SOLVE_TRIL_MBH_UB_OPT
     mchOutGM_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(mch_out));
-    // 顺序关键：xUB_ 与 l1_ 必须各为同位首个分配 -> 物理偏移与 cube 一致。
-    pipe_.InitBuffer(xUbBuf_, TILE_LEN * sizeof(half));
-    xUB_ = xUbBuf_.Get<half>();
-    pipe_.InitBuffer(l1Buf_, L1_SLOT_COUNT * L1_SLOT_ELEMS * sizeof(half));
-    l1_ = l1Buf_.Get<half>();
-    pipe_.InitBuffer(zeroUbBuf_, TILE_LEN * sizeof(half));
-    zeroUB_ = zeroUbBuf_.Get<half>();
-#endif
+    // 来自共享 Resource：xUB_/l1_ 取所属池偏移 0（与 AIC 对齐 -> 物理共享）；
+    // zeroUB_/ub_ 取 UB 池的更高偏移（AIV 私用，不与 AIC 冲突）。
+    xUB_    = res->ubBuf.template GetBufferByByte<half>(0);
+    l1_     = res->l1Buf.template GetBufferByByte<half>(0);
+    zeroUB_ = res->ubBuf.template GetBufferByByte<half>(TILE_LEN * sizeof(half));
+    ub_     = res->ubBuf.template GetBufferByByte<half>(2 * TILE_LEN * sizeof(half));
+#else
     pipe_.InitBuffer(ubBuf_, UB_AIV_ELEMS * sizeof(half));
     ub_ = ubBuf_.Get<half>();
+#endif
 }
 
 template <int MATRIX_SIZE>
