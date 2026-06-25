@@ -1160,17 +1160,16 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
     //   AIC SetFlag(AicReady)：常量就绪(L0)/本层结果已写回 xUB_(L>=1) -> AIV 可提取；
     //   AIC WaitFlag(AivReady)：AIV 已把 drv->SLOT_X、oth->SLOT_INPUT 提取到 L1 -> 可 Mmad。
     // 握手（1:2 MIX FFTS 计数，见 common.h）：
-    //   全点对点（每 flag 1 setter/1 waiter，见 common.h）：AIC 对 aicReady0/1 各 Set；
-    //   等 aivReady0/1 各 Wait。每 tile：aicReady_s Set = L（1 初始 + (L-1) spill），aivReady_s Wait = L。
-    PipeBarrier<PIPE_ALL>();
-    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(ubFlagAicReady0_);  // 常量就绪 -> sub0
-    Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE2>(ubFlagAicReady1_);  // 常量就绪 -> sub1
+    //   【跨核同步改用 SyncAll<false> 屏障】CrossCoreFlag 在本 1:2 MIX 上多种拓扑均死锁（实测），
+    //   改用本算子已验证可用的 SyncAll<false>（GM 通路靠它做 AIV->GM->AIC 的 aux 交接，11/11 通过）。
+    //   每层 2 个屏障：SP1 = xUB_ 就绪(level0 AIV已stage / level>=1 上层AIC已Spill) -> AIV 可提取；
+    //                 SP2 = AIV 提取完成(SLOT_X/INPUT 已写 L1) -> AIC 可 Mmad。
+    //   AIC 与 AIV(两 subcore) 每 tile 各调用 2L 次 SyncAll，计数恒等 -> 不死锁（单 tile 测试成立）。
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
         bool lastLevel = !(blockSize < MATRIX_SIZE / 2);
 
-        // 等两个 AIV subcore 都完成本层提取：SLOT_X=drv 块、SLOT_INPUT=oth 块
-        Catlass::Arch::CrossCoreWaitFlag(ubFlagAivReady0_);
-        Catlass::Arch::CrossCoreWaitFlag(ubFlagAivReady1_);
+        AscendC::SyncAll<false>();   // SP1: 等 xUB_ 就绪后 AIV 提取
+        AscendC::SyncAll<false>();   // SP2: 等 AIV 提取完成后 AIC matmul
         PipeBarrier<PIPE_ALL>();
 
 #if SOLVE_TRIL_UBOPT_DIAG != 7
@@ -1190,12 +1189,10 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
 
         if (!lastLevel) {
 #if SOLVE_TRIL_UBOPT_DIAG != 7
-            // 层间结果 L0C -> xUB_（Fixpipe，NZ）；通知两 subcore 可从 xUB_ 提取下一层
+            // 层间结果 L0C -> xUB_（Fixpipe，NZ）；下一层 SP1 屏障后 AIV 从 xUB_ 提取
             SpillL0CToUB();
             PipeBarrier<PIPE_ALL>();
 #endif
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ubFlagAicReady0_);
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ubFlagAicReady1_);
         }
         // lastLevel：结果留在 L0C，由 ProcessOneTile 的 StoreFinalResult 写出。
     }

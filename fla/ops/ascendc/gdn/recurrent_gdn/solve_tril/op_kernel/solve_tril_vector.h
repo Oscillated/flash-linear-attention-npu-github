@@ -192,15 +192,10 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
     }
 #endif
 
-    // 与 cube RecursiveMerge 的层循环一一对应（每层 1 次握手）。两 subcore 都进循环、
-    // 调用相同次数的 Wait(aicReady)/Set(aivReady)，以平衡 1:2 MIX 的 FFTS 跨核计数（见 Process 注释）。
+    // 与 cube RecursiveMerge 的层循环一一对应。跨核同步改用 SyncAll<false> 屏障（见 cube 侧说明）：
+    // 每层 SP1(xUB_就绪->提取) + SP2(提取完成->AIC matmul)，两 subcore 与 AIC 每 tile 各 2L 次，计数恒等。
     for (int32_t blockSize = FRAC; blockSize < MATRIX_SIZE; blockSize *= 2) {
-        // 等 AIC：常量就绪(L0)/本层结果已 Fixpipe 写回 xUB_(L>=1)。每 subcore 等自己的 aicReady_s。
-        if (subIdx == 0) {
-            Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady0_);
-        } else {
-            Catlass::Arch::CrossCoreWaitFlag(ubFlagAicReady1_);
-        }
+        AscendC::SyncAll<false>();   // SP1: 等 xUB_ 就绪
         PipeBarrier<PIPE_ALL>();
 
 #if SOLVE_TRIL_UBOPT_DIAG != 7
@@ -215,12 +210,7 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
         }
 #endif
 
-        // 通知 AIC：本 subcore 已就绪。每 subcore Set 自己的 flag（1:2 MIX FFTS 计数要求）。
-        if (subIdx == 0) {
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(ubFlagAivReady0_);
-        } else {
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(ubFlagAivReady1_);
-        }
+        AscendC::SyncAll<false>();   // SP2: 提取完成 -> 通知 AIC 可 matmul
     }
 }
 
