@@ -231,13 +231,6 @@ private:
 #if !SOLVE_TRIL_PLATFORM_ASCEND950
     Catlass::Arch::CrossCoreFlagWithReverse<> flagAivFinish_{SYNC_AIC_AIV_FLAG_SOLVE, SYNC_AIV_AIC_FLAG_SOLVE};
 #endif
-#if SOLVE_TRIL_MBH_UB_OPT
-    // UB 优化跨核握手（全点对点，每 flag 1 setter/1 waiter；见 common.h 死锁根因说明）。
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady0_{UBOPT_FLAG_AIC_READY_0};   // AIC -> AIV sub0
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady1_{UBOPT_FLAG_AIC_READY_1};   // AIC -> AIV sub1
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};   // AIV sub0 -> AIC
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};   // AIV sub1 -> AIC
-#endif
 };
 
 
@@ -348,9 +341,6 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Init(
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Process()
 {
-#if SOLVE_TRIL_UBOPT_DIAG == 1
-    return;   // 探针L1：Resource/Init 后立即返回
-#endif
     int64_t startTile = aicIdx_ * tilesPerCore_;
     int64_t endTile = startTile + tilesPerCore_;
 
@@ -368,13 +358,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::Process()
 #endif
 #else
     SyncAll<false>();
-#if SOLVE_TRIL_UBOPT_DIAG == 2
-    return;   // 探针L2：SyncAll 后返回
-#endif
     PrepareConstants();
-#if SOLVE_TRIL_UBOPT_DIAG == 3
-    return;   // 探针L3：PrepareConstants 后返回
-#endif
 #endif
 
     for (int64_t t = startTile; t < endTile; t++) {
@@ -479,10 +463,6 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
         MCHInvertDiagonal();
 #endif
 
-#if SOLVE_TRIL_UBOPT_DIAG == 4
-        return;   // 探针L4：staging(BT=16 的 LoadMchOutToSlotX) 后返回，隔离 LoadMchOutToSlotX
-#endif
-
         if constexpr (MATRIX_SIZE > FRAC) {
 #if SOLVE_TRIL_MBH_PASSTHROUGH == 1
             // 诊断1：跳过 MBH，仅 X×I 写回，验证多分形 matmul + 写回（应得 mch_out）
@@ -550,17 +530,8 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
 #else
-#if SOLVE_TRIL_UBOPT_DIAG == 7
-            // 探针L7：裸握手——跑 RecursiveMerge（内部数据op已 strip，仅保留跨核 flag），
-            //   不调 LoadFullInputForMBH。卡死 -> 握手拓扑/扇出有误；完成 -> 数据op故障。
-            RecursiveMerge();
-#elif SOLVE_TRIL_UBOPT_DIAG >= 4
-            // 探针L4/5/6：BT>16 跳过 RecursiveMerge（AIV 此时已早退不协作，cube 若跑会死锁）。
-            //   定位仅依赖 BT=16 单核路径。
-#else
             LoadFullInputForMBH(gmOffset);
             RecursiveMerge();
-#endif
 #endif
         } else {
 #if SOLVE_TRIL_PLATFORM_ASCEND950
@@ -572,17 +543,7 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::ProcessOneTile(int64_t tileId
             SetFlag<HardEvent::M_FIX>(EVT_M_FIX);
             WaitFlag<HardEvent::M_FIX>(EVT_M_FIX);
         }
-#if SOLVE_TRIL_UBOPT_DIAG == 5
-        return;   // 探针L5：matmul(BT=16) / RecursiveMerge 后、StoreFinalResult 前返回，隔离 matmul
-#elif SOLVE_TRIL_UBOPT_DIAG == 6
-        // 探针L6：仅 BT=16 跑 StoreFinalResult（纯 AIC 单核，无协作）；BT>16 在此返回，
-        //   既跳过 RecursiveMerge(DIAG>=4) 也跳过 StoreFinalResult -> 把“BT=16 的 StoreFinalResult”
-        //   从“BT>16 的 RecursiveMerge 跨核协作”中干净分离。
-        //   DIAG=6 卡死 -> BT=16 StoreFinalResult 是元凶；DIAG=6 不卡 -> 卡死在 RecursiveMerge(跨核)。
-        if constexpr (MATRIX_SIZE > FRAC) {
-            return;
-        }
-#endif
+        StoreFinalResult(gmOffset);
         StoreFinalResult(gmOffset);
     }
 }
@@ -1177,7 +1138,6 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
         AscendC::SyncAll<false>();   // SP2: 等 AIV 提取完成后 AIC matmul
         PipeBarrier<PIPE_ALL>();
 
-#if SOLVE_TRIL_UBOPT_DIAG != 7
         // step B: L0C = I × I = 完整单位阵
         MatmulToL0C(SLOT_I, SLOT_I, true);
         PipeBarrier<PIPE_ALL>();
@@ -1190,14 +1150,11 @@ __aicore__ inline void SolveTrilCube<MATRIX_SIZE>::RecursiveMerge()
         // step G: L0C += I × drv(SLOT_X)
         MatmulToL0C(SLOT_I, SLOT_X, false);
         PipeBarrier<PIPE_ALL>();
-#endif
 
         if (!lastLevel) {
-#if SOLVE_TRIL_UBOPT_DIAG != 7
             // 层间结果 L0C -> xUB_（Fixpipe，NZ）；下一层 SP1 屏障后 AIV 从 xUB_ 提取
             SpillL0CToUB();
             PipeBarrier<PIPE_ALL>();
-#endif
         }
         // lastLevel：结果留在 L0C，由 ProcessOneTile 的 StoreFinalResult 写出。
     }

@@ -87,12 +87,6 @@ private:
     int64_t isLower_;
 
     Catlass::Arch::CrossCoreFlagWithReverse<> flagAivFinish_{SYNC_AIV_AIC_FLAG_SOLVE, SYNC_AIC_AIV_FLAG_SOLVE};
-#if SOLVE_TRIL_MBH_UB_OPT
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady0_{UBOPT_FLAG_AIC_READY_0};   // AIC -> AIV sub0
-    Catlass::Arch::CrossCoreFlag ubFlagAicReady1_{UBOPT_FLAG_AIC_READY_1};   // AIC -> AIV sub1
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady0_{UBOPT_FLAG_AIV_READY_0};   // AIV sub0 -> AIC
-    Catlass::Arch::CrossCoreFlag ubFlagAivReady1_{UBOPT_FLAG_AIV_READY_1};   // AIV sub1 -> AIC
-#endif
 };
 
 template <int MATRIX_SIZE>
@@ -128,9 +122,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Init(
 template <int MATRIX_SIZE>
 __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
 {
-#if SOLVE_TRIL_UBOPT_DIAG == 1
-    return;   // 探针L1：Resource/Init 后立即返回
-#endif
     int32_t subIdx = static_cast<int32_t>(GetSubBlockIdx());
     int32_t blockIdx = static_cast<int32_t>(GetBlockIdx());
 
@@ -139,9 +130,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::Process()
         GenerateAuxMatrices();
     }
     SyncAll<false>();   // 所有 AIV 核各调用一次（与既有结构一致）
-#if SOLVE_TRIL_UBOPT_DIAG >= 2 && SOLVE_TRIL_UBOPT_DIAG != 7
-    return;   // 探针L2~L6：aux-gen+SyncAll 后返回（AIV 不协作）。L7 例外：跑裸握手。
-#endif
 
 #if SOLVE_TRIL_MBH_UB_OPT
     // UB 协作：仅 MATRIX_SIZE>FRAC（BT>16 才有 MBH 递归）。跨核同步用 SyncAll<false> 全局屏障，
@@ -174,7 +162,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
     int32_t othStart = isLower_ ? 0 : 1;
 
     // task2：MCH 输出 GM(ND) -> xUB_(UB, NZ)（GM->UB nd2nz）。仅 sub0 做数据搬运；sub1 只陪跑握手。
-#if SOLVE_TRIL_UBOPT_DIAG != 7
     if (subIdx == 0) {
         Nd2NzParams nd2nzParams;
         nd2nzParams.ndNum = 1;
@@ -188,7 +175,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
         DataCopy(xUB_, mchOutGM_, nd2nzParams);
         PipeBarrier<PIPE_ALL>();
     }
-#endif
 
     // 与 cube RecursiveMerge 的层循环一一对应。跨核同步改用 SyncAll<false> 屏障（见 cube 侧说明）：
     // 每层 SP1(xUB_就绪->提取) + SP2(提取完成->AIC matmul)，两 subcore 与 AIC 每 tile 各 2L 次，计数恒等。
@@ -196,7 +182,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
         AscendC::SyncAll<false>();   // SP1: 等 xUB_ 就绪
         PipeBarrier<PIPE_ALL>();
 
-#if SOLVE_TRIL_UBOPT_DIAG != 7
         if (subIdx == 0) {
             // 清 L1 提取目标槽（zeroUB->L1），再写选中分形（xUB->L1，raw）。全部 UB->L1，在 AIV sub0。
             ClearSlotUB(SLOT_X);
@@ -206,7 +191,6 @@ __aicore__ inline void SolveTrilVector<MATRIX_SIZE>::CooperateMergeOneTile(int32
             ExtractFromUB(SLOT_INPUT, blockSize, othStart);
             PipeBarrier<PIPE_ALL>();
         }
-#endif
 
         AscendC::SyncAll<false>();   // SP2: 提取完成 -> 通知 AIC 可 matmul
     }
