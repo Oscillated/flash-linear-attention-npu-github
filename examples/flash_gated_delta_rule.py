@@ -1159,7 +1159,8 @@ def _accuracy_tensor_names(value: str) -> list[str]:
 
 
 def _make_accuracy_config(args, *, query_heads: int, value_heads: int, key_dim: int, value_dim: int, scale: float) -> dict:
-    return {
+    has_explicit_cu_seqlens = bool(str(args.cu_seqlens or "").strip())
+    config = {
         "version": 1,
         "reference_version": _ACCURACY_REFERENCE_VERSION,
         "B": int(args.batch),
@@ -1178,10 +1179,12 @@ def _make_accuracy_config(args, *, query_heads: int, value_heads: int, key_dim: 
         "pre_normalize_qk": not bool(args.qk_l2norm),
         "varlen": bool(args.varlen),
         "cu_seqlens": str(args.cu_seqlens or ""),
-        "mean_len": int(args.mean_len),
         "scale": float(scale),
         "tensors": _accuracy_tensor_names(args.accuracy_tensors),
     }
+    if bool(args.varlen) and not has_explicit_cu_seqlens:
+        config["mean_len"] = int(args.mean_len)
+    return config
 
 
 def _accuracy_golden_path(cache_dir: Path, case_name: str, config: dict) -> Path:
