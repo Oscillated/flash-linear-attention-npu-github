@@ -74,13 +74,14 @@ struct GDNFwdHStream {
     uint32_t tokenOffset;
     uint32_t batchChunks{0};
     uint32_t batchTokens;
+    uint32_t nextTaskIdx{0};
+    bool active{false};
 
     GDNFwdHOffsets offset;
 };
 
 struct GDNFwdHRunningQ {
     GDNFwdHStream streams[PING_PONG_STAGES];
-    uint32_t head{0};
 };
 
 struct BlockSchedulerGdnFwdH {
@@ -101,20 +102,15 @@ struct BlockSchedulerGdnFwdH {
     uint32_t numChunksWorkspaceOffset;
 
     uint32_t taskIdx;
-    uint32_t taskLoops;
+    uint32_t taskStride;
     uint32_t cubeCoreIdx;
     uint32_t cubeCoreNum;
     uint32_t taskNum;
     uint32_t headGroups;
     uint32_t totalChunks;
     uint32_t totalTokens;
-    bool hasDummyHead;
 
     GDNFwdHRunningQ runningQ;
-    uint32_t curLoopIdx;
-    uint32_t curLoopTaskBegin;
-    uint32_t curLoopTaskCnt;
-    uint32_t lastLoopTaskCnt;
 
     bool isRunning;
 
@@ -183,24 +179,16 @@ struct BlockSchedulerGdnFwdH {
         vBlockSize = vHeadDim;
         taskNum = batch * vNumHead;
         headGroups = vNumHead / kNumHead;
-        hasDummyHead = (taskNum % (PING_PONG_STAGES * cubeCoreNum) <= cubeCoreNum) && (taskNum % (PING_PONG_STAGES * cubeCoreNum) > 0);
-        taskLoops = (taskNum + cubeCoreNum * PING_PONG_STAGES - 1) / (cubeCoreNum * PING_PONG_STAGES);
         uint32_t maxTaskCntPerLoop = taskNum > cubeCoreNum ? PING_PONG_STAGES : 1;
-        curLoopTaskBegin = cubeCoreIdx * maxTaskCntPerLoop;
-        uint32_t lastLoopTaskBegin = curLoopTaskBegin + (taskLoops - 1) * maxTaskCntPerLoop * cubeCoreNum;
-        if (lastLoopTaskBegin >= taskNum) {
-            lastLoopTaskCnt = 0;
-        } else {
-            uint32_t maxTaskCntLastLoop = hasDummyHead ? 1 : PING_PONG_STAGES;
-            lastLoopTaskCnt = taskNum - lastLoopTaskBegin;
-            if (lastLoopTaskCnt >= maxTaskCntLastLoop) {
-                lastLoopTaskCnt = maxTaskCntLastLoop;
-            }
+        taskStride = cubeCoreNum * maxTaskCntPerLoop;
+        for (uint32_t streamId = 0; streamId < PING_PONG_STAGES; ++streamId) {
+            auto& stream = runningQ.streams[streamId];
+            stream.nextTaskIdx = (streamId < maxTaskCntPerLoop) ? (cubeCoreIdx * maxTaskCntPerLoop + streamId) : taskNum;
+            stream.chunkIdx = 0;
+            stream.batchChunks = 0;
+            stream.active = false;
         }
-        curLoopTaskCnt = taskLoops > 1 ? PING_PONG_STAGES : lastLoopTaskCnt;
-        curLoopIdx = -1; // -1: 第一次创建task时会将curLoopIdx加1
-        taskIdx = curLoopTaskBegin + PING_PONG_STAGES; // 第一次创建task时重新初始化taskIdx
-        isRunning = curLoopTaskBegin < taskNum;
+        isRunning = cubeCoreIdx * maxTaskCntPerLoop < taskNum;
 
     }
 
@@ -217,6 +205,24 @@ struct BlockSchedulerGdnFwdH {
         newStream.tokenOffset = isVariedLen ? gmNumSeq.GetValue(newStream.tokenBatchIdx) : 0;
         newStream.batchTokens = isVariedLen ? (gmNumSeq.GetValue(newStream.tokenBatchIdx + 1) - newStream.tokenOffset) : totalTokens;
         newStream.chunkIdx = 0;
+    }
+
+    CATLASS_DEVICE
+    void AssignNextStream(uint32_t streamId) {
+        auto& stream = runningQ.streams[streamId];
+        taskIdx = stream.nextTaskIdx;
+        if (taskIdx >= taskNum) {
+            stream.active = false;
+            stream.batchChunks = 0;
+            return;
+        }
+
+        stream.nextTaskIdx += taskStride;
+        InitNewStream(stream);
+        stream.active = stream.batchChunks > 0;
+        if (stream.active) {
+            UpdateTask(streamId);
+        }
     }
 
     CATLASS_DEVICE
@@ -248,67 +254,35 @@ struct BlockSchedulerGdnFwdH {
 
     CATLASS_DEVICE
     void InitTasks() {
-        //auto oldHead = runningQ.head;
-        auto streamId = runningQ.head;
-        for (uint32_t i = 0; i < PING_PONG_STAGES; ++i) {
-            //auto streamId = (oldHead + i) % PING_PONG_STAGES;
+        isRunning = false;
+        for (uint32_t streamId = 0; streamId < PING_PONG_STAGES; ++streamId) {
             auto& stream = runningQ.streams[streamId];
-            stream.chunkIdx += 1;
-            if (StreamIsDone(stream)) {
-                // 当前stream已完成，用一个新stream替换它
-                taskIdx += 1;
-                if (taskIdx >= (curLoopTaskBegin + curLoopTaskCnt)) {
-                    curLoopIdx += 1;
-                    // curLoopTaskBegin = curLoopIdx * PING_PONG_STAGES * cubeCoreNum + PING_PONG_STAGES * cubeCoreIdx;
-                    // if (curLoopIdx + 1 >= taskLoops) {
-                    //     curLoopTaskCnt = lastLoopTaskCnt;
-                    // }
-                    if (curLoopIdx + 1 < taskLoops) {
-                        curLoopTaskBegin = curLoopIdx * PING_PONG_STAGES * cubeCoreNum + PING_PONG_STAGES * cubeCoreIdx;
-                    } else {
-                        curLoopTaskBegin = curLoopIdx * PING_PONG_STAGES * cubeCoreNum + (hasDummyHead ? 1 : PING_PONG_STAGES) * cubeCoreIdx;
-                        curLoopTaskCnt = lastLoopTaskCnt;
-                    }
-                    taskIdx = curLoopTaskBegin;
+            if (stream.active) {
+                stream.chunkIdx += 1;
+                if (stream.chunkIdx >= stream.batchChunks) {
+                    stream.active = false;
+                    stream.batchChunks = 0;
                 }
-
-                //runningQ.head = (streamId + 1) % PING_PONG_STAGES;
-                stream.batchChunks = 0;
-                if (taskIdx < taskNum) {
-                    InitNewStream(stream);
-                    UpdateTask(streamId);
-                }
-
-                if (streamId == runningQ.head) {
-                    runningQ.head = (runningQ.head + 1) % PING_PONG_STAGES;
-                    if (taskIdx >= taskNum) {
-                        // 没有新stream了，将head推进到下一个未完成的stream上
-                        for (uint32_t j = 0; j < PING_PONG_STAGES && StreamIsDone(runningQ.streams[runningQ.head]); ++j) {
-                            runningQ.head = (runningQ.head + 1) % PING_PONG_STAGES;
-                        }
-                        isRunning = ! StreamIsDone(runningQ.streams[runningQ.head]);
-                    }
-                    streamId = runningQ.head;
-                }
-                else {
-                    streamId = (streamId + 1) % PING_PONG_STAGES;
-                }
-
+            }
+            if (!stream.active) {
+                AssignNextStream(streamId);
             } else {
                 UpdateTask(streamId);
-                streamId = (streamId + 1) % PING_PONG_STAGES;
+            }
+            if (stream.active) {
+                isRunning = true;
             }
         }
     }
 
     CATLASS_DEVICE
     const GDNFwdHStream& GetStream(uint32_t i) const {
-        return runningQ.streams[(runningQ.head + i) % PING_PONG_STAGES];
+        return runningQ.streams[i];
     }
 
     CATLASS_DEVICE
     uint32_t GetStreamId(uint32_t i) const {
-        return (runningQ.head + i) % PING_PONG_STAGES;
+        return i;
     }
 
     CATLASS_DEVICE
@@ -318,7 +292,7 @@ struct BlockSchedulerGdnFwdH {
 
     CATLASS_DEVICE
     bool StreamIsDone(const GDNFwdHStream& stream) const {
-        return stream.chunkIdx >= stream.batchChunks;
+        return !stream.active;
     }
 
     CATLASS_DEVICE

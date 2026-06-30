@@ -159,6 +159,7 @@ public:
             rowEnd = mActual;
         }
         if (rowBegin >= mActual) {
+            Arch::CrossCoreWaitFlag(cube2Done);
             return;
         }
 

@@ -212,6 +212,8 @@ public:
             rowEnd = mActual;
         }
         if (rowBegin >= mActual) {
+            Arch::CrossCoreWaitFlag(cube1Done);
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
             return;
         }
 
