@@ -442,67 +442,6 @@ def _chunk_list(
     return chunk_indices_list.get(str(chunk_size))
 
 
-_RECOMPUTE_WU_FALLBACK_WARNED = False
-_RECOMPUTE_WU_FORCE_FALLBACK = False
-
-
-def _pad_time_dim(x: torch.Tensor, pad_t: int) -> torch.Tensor:
-    if pad_t == 0:
-        return x
-    if x.ndim == 3:
-        return F.pad(x, (0, pad_t))
-    if x.ndim == 4:
-        return F.pad(x, (0, 0, 0, pad_t))
-    raise ValueError(f"expected rank-3 or rank-4 tensor, got shape={tuple(x.shape)}.")
-
-
-def _recompute_w_u_torch(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    A: torch.Tensor,
-    g: torch.Tensor,
-    *,
-    chunk_size: int,
-    cu_seqlens: Optional[list[int]],
-    chunk_indices: Optional[list[int]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    beta_k = beta.to(k.dtype)
-    exp_g = torch.exp(g.float()).to(k.dtype)
-    k_scaled = k * (beta_k * exp_g).unsqueeze(-1)
-    v_scaled = v * beta_k.unsqueeze(-1)
-
-    if cu_seqlens is None:
-        B, H, T, K = k.shape
-        V = v.shape[-1]
-        num_chunks = (T + chunk_size - 1) // chunk_size
-        padded_t = num_chunks * chunk_size
-        pad_t = padded_t - T
-        A_blocks = _pad_time_dim(A, pad_t).reshape(B, H, num_chunks, chunk_size, chunk_size)
-        k_blocks = _pad_time_dim(k_scaled, pad_t).reshape(B, H, num_chunks, chunk_size, K)
-        v_blocks = _pad_time_dim(v_scaled, pad_t).reshape(B, H, num_chunks, chunk_size, V)
-        w = torch.matmul(A_blocks, k_blocks).reshape(B, H, padded_t, K)[:, :, :T, :].contiguous()
-        u = torch.matmul(A_blocks, v_blocks).reshape(B, H, padded_t, V)[:, :, :T, :].contiguous()
-        return w.to(k.dtype), u.to(v.dtype)
-
-    if chunk_indices is None:
-        raise ValueError("chunk_indices is required when cu_seqlens is provided.")
-
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
-    for idx in range(0, len(chunk_indices), 2):
-        seq_idx = chunk_indices[idx]
-        chunk_idx = chunk_indices[idx + 1]
-        bos = cu_seqlens[seq_idx] + chunk_idx * chunk_size
-        eos = min(bos + chunk_size, cu_seqlens[seq_idx + 1])
-        if eos <= bos:
-            continue
-        A_chunk = A[:, :, bos:eos, : eos - bos]
-        w[:, :, bos:eos, :] = torch.matmul(A_chunk, k_scaled[:, :, bos:eos, :]).to(k.dtype)
-        u[:, :, bos:eos, :] = torch.matmul(A_chunk, v_scaled[:, :, bos:eos, :]).to(v.dtype)
-    return w, u
-
-
 def recompute_w_u(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -514,46 +453,22 @@ def recompute_w_u(
     cu_seqlens: Optional[list[int]],
     chunk_indices: Optional[list[int]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    global _RECOMPUTE_WU_FALLBACK_WARNED, _RECOMPUTE_WU_FORCE_FALLBACK
+    if not hasattr(torch.ops.npu, "npu_recompute_w_u_fwd"):
+        raise RuntimeError("torch.ops.npu.npu_recompute_w_u_fwd is unavailable. Please rebuild and install fla_npu.")
 
-    use_recompute_op = os.environ.get("FLASH_GDR_USE_ASCENDC_RECOMPUTE", "0") == "1"
-    if use_recompute_op and not _RECOMPUTE_WU_FORCE_FALLBACK and hasattr(torch.ops.npu, "npu_recompute_w_u_fwd"):
-        try:
-            w, u = torch.ops.npu.npu_recompute_w_u_fwd(
-                k,
-                v,
-                beta,
-                A,
-                chunk_size,
-                g=g,
-                gk=None,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
-            torch.npu.synchronize()
-            return w, u
-        except RuntimeError as exc:
-            message = str(exc)
-            if "RecomputeWUFwd" not in message and "npu_recompute_w_u_fwd" not in message:
-                raise
-            _RECOMPUTE_WU_FORCE_FALLBACK = True
-            if not _RECOMPUTE_WU_FALLBACK_WARNED:
-                warnings.warn(
-                    "npu_recompute_w_u_fwd failed to launch; falling back to torch chunk matmul for this example.",
-                    RuntimeWarning,
-                )
-                _RECOMPUTE_WU_FALLBACK_WARNED = True
-
-    return _recompute_w_u_torch(
+    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
         k,
         v,
         beta,
         A,
-        g,
-        chunk_size=chunk_size,
+        chunk_size,
+        g=g,
+        gk=None,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    torch.npu.synchronize()
+    return w, u
 
 
 def flash_chunk_gated_delta_rule_fwd(
