@@ -24,8 +24,6 @@
       "--seed",
       "20260630",
       "--accuracy-check",
-      "--accuracy-cache-dir",
-      "third_party/gdr_accuracy_golden",
       "--accuracy-tensors",
       "o"
     ]
@@ -56,9 +54,7 @@
       "42",
       "--scale",
       "0.1",
-      "--accuracy-check",
-      "--accuracy-cache-dir",
-      "third_party/gdr_accuracy_golden"
+      "--accuracy-check"
     ]
   },
   {
@@ -89,9 +85,7 @@
       "0.1",
       "--cu-seqlens",
       "0,64,128",
-      "--accuracy-check",
-      "--accuracy-cache-dir",
-      "third_party/gdr_accuracy_golden"
+      "--accuracy-check"
     ]
   },
   {
@@ -122,9 +116,7 @@
       "0.1",
       "--cu-seqlens",
       "0,1024,2048,3991",
-      "--accuracy-check",
-      "--accuracy-cache-dir",
-      "third_party/gdr_accuracy_golden"
+      "--accuracy-check"
     ]
   }
 ]

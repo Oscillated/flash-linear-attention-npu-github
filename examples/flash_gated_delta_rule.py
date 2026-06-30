@@ -26,6 +26,7 @@ from fla.ops.triton.triton_core.utils import autocast_custom_bwd, autocast_custo
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
 _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
+_ACCURACY_REFERENCE_VERSION = 1
 
 
 def _make_gate(shape: tuple[int, ...], dtype: torch.dtype, device: str, gate_function: str) -> torch.Tensor:
@@ -1245,6 +1246,7 @@ def _accuracy_tensor_names(value: str) -> list[str]:
 def _make_accuracy_config(args, *, query_heads: int, value_heads: int, key_dim: int, value_dim: int, scale: float) -> dict:
     return {
         "version": 1,
+        "reference_version": _ACCURACY_REFERENCE_VERSION,
         "B": int(args.batch),
         "T": int(args.tokens),
         "query_heads": int(query_heads),
@@ -1630,7 +1632,10 @@ def _main():
     )
     parser.add_argument("--conv-kernel", type=int, default=4, help="depthwise causal conv kernel size")
     parser.add_argument("--accuracy-check", action="store_true")
-    parser.add_argument("--accuracy-cache-dir", default="third_party/gdr_accuracy_golden")
+    parser.add_argument(
+        "--accuracy-cache-dir",
+        default=os.environ.get("GDR_ACCURACY_CACHE_DIR", "third_party/gdr_accuracy_golden"),
+    )
     parser.add_argument("--accuracy-force-regenerate", action="store_true")
     parser.add_argument("--accuracy-tensors", default="o,dq,dk,dv,dbeta,dg")
     parser.add_argument("--accuracy-output-tol", type=float, default=5e-3)
