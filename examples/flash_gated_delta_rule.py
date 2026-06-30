@@ -16,11 +16,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 
-from fla.ops.triton.triton_core.causal_conv1d import causal_conv1d_triton
 from fla.ops.triton.triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.triton.triton_core.cumsum import chunk_local_cumsum
 from fla.ops.triton.triton_core.l2norm import l2norm_bwd, l2norm_fwd
-from fla.ops.triton.triton_core.solve_tril_fast import solve_tril_npu as solve_tril
 from fla.ops.triton.triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
@@ -78,6 +76,279 @@ def _as_int_list(value: Optional[list[int] | torch.Tensor]) -> Optional[list[int
     if isinstance(value, torch.Tensor):
         return [int(x) for x in value.detach().cpu().flatten().tolist()]
     return [int(x) for x in value]
+
+
+def _activation_mode(activation: Optional[str]) -> int:
+    if activation is None or activation == "":
+        return 0
+    if activation in ("silu", "swish"):
+        return 1
+    raise ValueError(f"Unsupported causal_conv1d activation: {activation}")
+
+
+def _silu_backward(grad: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    sigmoid = torch.sigmoid(x)
+    return grad * sigmoid * (1.0 + x * (1.0 - sigmoid))
+
+
+def _flatten_varlen_x(
+    x: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[list[int]], bool]:
+    if cu_seqlens is None:
+        return x, None, False
+
+    cu_list = _as_int_list(cu_seqlens)
+    if x.ndim == 3:
+        if x.shape[0] != 1:
+            raise ValueError("causal_conv1d varlen path expects x.shape[0] == 1 for [1, T, D] input.")
+        return x.reshape(x.shape[1], x.shape[2]).contiguous(), cu_list, True
+    if x.ndim == 2:
+        return x.contiguous(), cu_list, True
+    raise ValueError(f"causal_conv1d varlen path expects rank-2 or rank-3 input, got shape={tuple(x.shape)}.")
+
+
+def _flat_to_head_layout(x: torch.Tensor, head_num: int, *, is_varlen: bool) -> torch.Tensor:
+    if head_num <= 0:
+        return x
+    if x.shape[-1] % head_num != 0:
+        raise ValueError(f"last dimension must be divisible by head_num, got shape={tuple(x.shape)}, head_num={head_num}.")
+    head_dim = x.shape[-1] // head_num
+    if is_varlen:
+        flat_x = x.reshape(-1, x.shape[-1]) if x.ndim == 3 else x
+        return flat_x.reshape(flat_x.shape[0], head_num, head_dim).transpose(0, 1).contiguous()
+    return x.reshape(x.shape[0], x.shape[1], head_num, head_dim).transpose(1, 2).contiguous()
+
+
+def _head_to_flat_layout(x: torch.Tensor, *, is_varlen: bool, batch_size: int) -> torch.Tensor:
+    if is_varlen:
+        x_head = x.squeeze(0) if x.ndim == 4 and x.shape[0] == 1 else x
+        return x_head.transpose(0, 1).reshape(-1, x_head.shape[0] * x_head.shape[-1]).contiguous()
+    return x.transpose(1, 2).reshape(batch_size, x.shape[2], x.shape[1] * x.shape[-1]).contiguous()
+
+
+def _prepare_conv_states(
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+    *,
+    num_sequences: int,
+    width: int,
+    dim: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_len = width - 1
+    if initial_state is None:
+        conv_states = torch.zeros(num_sequences, state_len, dim, dtype=x.dtype, device=x.device)
+        return conv_states, None
+
+    if initial_state.ndim != 3 or initial_state.shape[0] != num_sequences:
+        raise ValueError(
+            "initial_state must be rank-3 and match the sequence count, "
+            f"got shape={tuple(initial_state.shape)} and num_sequences={num_sequences}."
+        )
+
+    if initial_state.shape[1] == dim and initial_state.shape[2] >= width:
+        state_for_bwd = initial_state.transpose(1, 2).contiguous()
+    elif initial_state.shape[2] == dim and initial_state.shape[1] >= width:
+        state_for_bwd = initial_state.contiguous()
+    else:
+        raise ValueError(
+            "initial_state must use [N, D, W] or [N, W, D] layout with W >= kernel width; "
+            f"got shape={tuple(initial_state.shape)}, dim={dim}, width={width}."
+        )
+
+    conv_states = state_for_bwd[:, -state_len:, :].contiguous()
+    return conv_states, state_for_bwd
+
+
+def _causal_conv1d_final_state(
+    x: torch.Tensor,
+    *,
+    width: int,
+    initial_state: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+) -> torch.Tensor:
+    dim = x.shape[-1]
+    cu_list = _as_int_list(cu_seqlens)
+    if cu_list is None:
+        sequences = [x[i] for i in range(x.shape[0])]
+    else:
+        flat_x = x.reshape(-1, dim) if x.ndim == 3 else x
+        sequences = [flat_x[cu_list[i] : cu_list[i + 1]] for i in range(len(cu_list) - 1)]
+
+    states = []
+    for idx, seq in enumerate(sequences):
+        prev = None
+        if initial_state is not None:
+            prev = initial_state[idx]
+            if prev.shape[0] != dim:
+                prev = prev.transpose(0, 1).contiguous()
+        hist = seq.transpose(0, 1).contiguous()
+        if prev is not None:
+            hist = torch.cat([prev[:, -width:], hist], dim=-1)
+        if hist.shape[-1] < width:
+            hist = F.pad(hist, (width - hist.shape[-1], 0))
+        states.append(hist[:, -width:])
+    return torch.stack(states, dim=0)
+
+
+def solve_tri_ascendc(
+    A: torch.Tensor,
+    *,
+    cu_seqlens: Optional[list[int] | torch.Tensor] = None,
+    chunk_indices: Optional[list[int] | torch.Tensor] = None,
+    output_dtype: torch.dtype = torch.float,
+) -> torch.Tensor:
+    if not hasattr(torch.ops.npu, "npu_solve_tri"):
+        raise RuntimeError("torch.ops.npu.npu_solve_tri is unavailable. Please rebuild and install the latest fla_npu.")
+
+    A_in = A.to(output_dtype).contiguous()
+    cu_list = _as_int_list(cu_seqlens)
+    chunk_list = _as_int_list(chunk_indices)
+
+    if cu_list is None:
+        return torch.ops.npu.npu_solve_tri(A_in, layout="bsnd")
+
+    if A_in.ndim != 4 or A_in.shape[0] != 1:
+        raise ValueError(f"solve_tri varlen path expects A with shape [1, T, H, BT], got {tuple(A_in.shape)}.")
+    if chunk_list is None:
+        raise ValueError("solve_tri varlen path requires chunk_indices.")
+
+    out = torch.ops.npu.npu_solve_tri(
+        A_in.squeeze(0),
+        cu_seqlens=cu_list,
+        chunk_indices=chunk_list,
+        layout="tnd",
+    )
+    return out.unsqueeze(0)
+
+
+class AscendCCausalConv1dFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        H: int,
+        bias: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        initial_state: Optional[torch.Tensor] = None,
+        activation: Optional[str] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        output_final_state: bool = False,
+    ):
+        if not hasattr(torch.ops.npu, "npu_causal_conv1d"):
+            raise RuntimeError("torch.ops.npu.npu_causal_conv1d is unavailable. Please rebuild and install fla_npu.")
+
+        activation_mode = _activation_mode(activation)
+        op_weight = weight.transpose(-1, -2).contiguous()
+        width, dim = op_weight.shape
+        op_x, query_start_loc, is_varlen = _flatten_varlen_x(x, cu_seqlens)
+        num_sequences = len(query_start_loc) - 1 if query_start_loc is not None else int(x.shape[0])
+        conv_states, initial_state_bwd = _prepare_conv_states(
+            x,
+            initial_state,
+            num_sequences=num_sequences,
+            width=width,
+            dim=dim,
+        )
+        initial_state_mode = [1] * num_sequences if initial_state is not None else None
+
+        preactivation = torch.ops.npu.npu_causal_conv1d(
+            op_x,
+            op_weight,
+            bias,
+            conv_states,
+            query_start_loc=query_start_loc,
+            initial_state_mode=initial_state_mode,
+            activation_mode=0,
+            pad_slot_id=-1,
+            run_mode=0,
+            head_num=H,
+        )
+        if is_varlen:
+            preactivation = preactivation.unsqueeze(0)
+        if residual is not None:
+            preactivation = preactivation + _flat_to_head_layout(residual, H, is_varlen=is_varlen)
+
+        y = F.silu(preactivation) if activation_mode != 0 else preactivation
+        final_state = None
+        if output_final_state:
+            final_state = _causal_conv1d_final_state(
+                x,
+                width=width,
+                initial_state=initial_state,
+                cu_seqlens=cu_seqlens,
+            )
+
+        ctx.save_for_backward(x, op_weight, bias, residual, initial_state_bwd, preactivation)
+        ctx.activation_mode = activation_mode
+        ctx.query_start_loc = query_start_loc
+        ctx.is_varlen = is_varlen
+        ctx.head_num = H
+        ctx.batch_size = x.shape[0] if x.ndim == 3 else 1
+        ctx.had_bias = bias is not None
+        ctx.had_residual = residual is not None
+        ctx.had_initial_state = initial_state is not None
+        return y, final_state
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor, dht: Optional[torch.Tensor] = None):
+        if not hasattr(torch.ops.npu, "npu_causal_conv1d_bwd"):
+            raise RuntimeError("torch.ops.npu.npu_causal_conv1d_bwd is unavailable. Please rebuild and install fla_npu.")
+
+        x, op_weight, bias, residual, initial_state_bwd, preactivation = ctx.saved_tensors
+        op_x = x.reshape(-1, x.shape[-1]).contiguous() if ctx.is_varlen and x.ndim == 3 else x.contiguous()
+        op_dy = dy.squeeze(0).contiguous() if ctx.is_varlen and dy.ndim == 4 else dy.contiguous()
+        op_y = preactivation.squeeze(0).contiguous() if ctx.is_varlen and preactivation.ndim == 4 else preactivation.contiguous()
+        dht_bwd = None
+        if dht is not None:
+            dht_bwd = dht.transpose(1, 2).contiguous() if dht.ndim == 3 and dht.shape[1] == x.shape[-1] else dht
+
+        dx, dw, db, dh0 = torch.ops.npu.npu_causal_conv1d_bwd(
+            x=op_x,
+            y=op_y if ctx.activation_mode != 0 else None,
+            weight=op_weight,
+            dy=op_dy,
+            initial_state=initial_state_bwd if ctx.had_initial_state else None,
+            dht=dht_bwd,
+            query_start_loc=ctx.query_start_loc,
+            activation=ctx.activation_mode,
+            input_layout="NTD" if ctx.is_varlen else "BNSD",
+        )
+
+        dx = dx.reshape_as(x)
+        dw = dw.transpose(0, 1).contiguous()
+        db = db if ctx.had_bias else None
+        dr = None
+        if ctx.had_residual:
+            dr_head = _silu_backward(dy, preactivation) if ctx.activation_mode != 0 else dy
+            dr = _head_to_flat_layout(dr_head, is_varlen=ctx.is_varlen, batch_size=ctx.batch_size)
+        dh0 = dh0.transpose(1, 2).contiguous() if ctx.had_initial_state else None
+        return dx, dw, None, db, dr, dh0, None, None, None
+
+
+def causal_conv1d_ascendc(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    H: int,
+    bias: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    return AscendCCausalConv1dFunction.apply(
+        x,
+        weight,
+        H,
+        bias,
+        residual,
+        initial_state,
+        activation,
+        cu_seqlens,
+        output_final_state,
+    )
 
 
 def _as_chunk_dict(
@@ -168,6 +439,120 @@ def _chunk_list(
     return chunk_indices_list.get(str(chunk_size))
 
 
+_RECOMPUTE_WU_FALLBACK_WARNED = False
+_RECOMPUTE_WU_FORCE_FALLBACK = False
+
+
+def _pad_time_dim(x: torch.Tensor, pad_t: int) -> torch.Tensor:
+    if pad_t == 0:
+        return x
+    if x.ndim == 3:
+        return F.pad(x, (0, pad_t))
+    if x.ndim == 4:
+        return F.pad(x, (0, 0, 0, pad_t))
+    raise ValueError(f"expected rank-3 or rank-4 tensor, got shape={tuple(x.shape)}.")
+
+
+def _recompute_w_u_torch(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    g: torch.Tensor,
+    *,
+    chunk_size: int,
+    cu_seqlens: Optional[list[int]],
+    chunk_indices: Optional[list[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    beta_k = beta.to(k.dtype)
+    exp_g = torch.exp(g.float()).to(k.dtype)
+    k_scaled = k * (beta_k * exp_g).unsqueeze(-1)
+    v_scaled = v * beta_k.unsqueeze(-1)
+
+    if cu_seqlens is None:
+        B, H, T, K = k.shape
+        V = v.shape[-1]
+        num_chunks = (T + chunk_size - 1) // chunk_size
+        padded_t = num_chunks * chunk_size
+        pad_t = padded_t - T
+        A_blocks = _pad_time_dim(A, pad_t).reshape(B, H, num_chunks, chunk_size, chunk_size)
+        k_blocks = _pad_time_dim(k_scaled, pad_t).reshape(B, H, num_chunks, chunk_size, K)
+        v_blocks = _pad_time_dim(v_scaled, pad_t).reshape(B, H, num_chunks, chunk_size, V)
+        w = torch.matmul(A_blocks, k_blocks).reshape(B, H, padded_t, K)[:, :, :T, :].contiguous()
+        u = torch.matmul(A_blocks, v_blocks).reshape(B, H, padded_t, V)[:, :, :T, :].contiguous()
+        return w.to(k.dtype), u.to(v.dtype)
+
+    if chunk_indices is None:
+        raise ValueError("chunk_indices is required when cu_seqlens is provided.")
+
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    for idx in range(0, len(chunk_indices), 2):
+        seq_idx = chunk_indices[idx]
+        chunk_idx = chunk_indices[idx + 1]
+        bos = cu_seqlens[seq_idx] + chunk_idx * chunk_size
+        eos = min(bos + chunk_size, cu_seqlens[seq_idx + 1])
+        if eos <= bos:
+            continue
+        A_chunk = A[:, :, bos:eos, : eos - bos]
+        w[:, :, bos:eos, :] = torch.matmul(A_chunk, k_scaled[:, :, bos:eos, :]).to(k.dtype)
+        u[:, :, bos:eos, :] = torch.matmul(A_chunk, v_scaled[:, :, bos:eos, :]).to(v.dtype)
+    return w, u
+
+
+def recompute_w_u(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    g: torch.Tensor,
+    *,
+    chunk_size: int,
+    cu_seqlens: Optional[list[int]],
+    chunk_indices: Optional[list[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _RECOMPUTE_WU_FALLBACK_WARNED, _RECOMPUTE_WU_FORCE_FALLBACK
+
+    use_recompute_op = os.environ.get("FLASH_GDR_USE_ASCENDC_RECOMPUTE", "0") == "1"
+    if use_recompute_op and not _RECOMPUTE_WU_FORCE_FALLBACK and hasattr(torch.ops.npu, "npu_recompute_w_u_fwd"):
+        try:
+            w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+                k,
+                v,
+                beta,
+                A,
+                chunk_size,
+                g=g,
+                gk=None,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
+            torch.npu.synchronize()
+            return w, u
+        except RuntimeError as exc:
+            message = str(exc)
+            if "RecomputeWUFwd" not in message and "npu_recompute_w_u_fwd" not in message:
+                raise
+            _RECOMPUTE_WU_FORCE_FALLBACK = True
+            if not _RECOMPUTE_WU_FALLBACK_WARNED:
+                warnings.warn(
+                    "npu_recompute_w_u_fwd failed to launch; falling back to torch chunk matmul for this example.",
+                    RuntimeWarning,
+                )
+                _RECOMPUTE_WU_FALLBACK_WARNED = True
+
+    return _recompute_w_u_torch(
+        k,
+        v,
+        beta,
+        A,
+        g,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+
 def flash_chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -202,10 +587,10 @@ def flash_chunk_gated_delta_rule_fwd(
         output_dtype=torch.float32,
     )
 
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_out=chunk_indices,
+    A = solve_tri_ascendc(
+        A,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
         output_dtype=k.dtype,
     )
 
@@ -213,14 +598,13 @@ def flash_chunk_gated_delta_rule_fwd(
     beta = beta.transpose(1, 2).contiguous().float()
     A = A.transpose(1, 2).contiguous()
 
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    w, u = recompute_w_u(
         k,
         v,
         beta,
         A,
-        chunk_size,
-        g=g,
-        gk=None,
+        g,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
@@ -282,14 +666,13 @@ def flash_chunk_gated_delta_rule_bwd(
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
 
-    w, u = torch.ops.npu.npu_recompute_w_u_fwd(
+    w, u = recompute_w_u(
         k,
         v,
         beta,
         A,
-        chunk_size,
-        g=g,
-        gk=None,
+        g,
+        chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=_chunk_list(chunk_indices_list, chunk_size),
     )
@@ -656,6 +1039,11 @@ class DemoGatedDeltaNet(nn.Module):
                 "num_value_heads must be an integer multiple of num_key_heads "
                 f"for the current grouped-value smoke path, got {self.num_v_heads} and {self.num_k_heads}."
             )
+        if key_head_dim != value_head_dim:
+            raise ValueError(
+                "DemoGatedDeltaNet uses causal_conv1d head-first output, which requires "
+                f"key_head_dim == value_head_dim, got {key_head_dim} and {value_head_dim}."
+            )
         self.head_k_dim = key_head_dim
         self.head_v_dim = value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
@@ -699,7 +1087,7 @@ class DemoGatedDeltaNet(nn.Module):
         if cu_seqlens is not None and cu_seqlens.device != mixed_qkv.device:
             cu_seqlens = cu_seqlens.to(mixed_qkv.device)
 
-        mixed_qkv, _ = causal_conv1d_triton(
+        mixed_qkv, _ = causal_conv1d_ascendc(
             mixed_qkv,
             weight=weight,
             H=2 * self.num_k_heads + self.num_v_heads,
@@ -711,10 +1099,9 @@ class DemoGatedDeltaNet(nn.Module):
             output_final_state=False,
         )
 
-        query, key, value = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
-        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
-        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim).transpose(1, 2).contiguous()
+        query = mixed_qkv[:, : self.num_k_heads].contiguous()
+        key = mixed_qkv[:, self.num_k_heads : 2 * self.num_k_heads].contiguous()
+        value = mixed_qkv[:, 2 * self.num_k_heads :].contiguous()
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
