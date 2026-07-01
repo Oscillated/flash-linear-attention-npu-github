@@ -1,15 +1,6 @@
 """
 test_npu_solve_tril.py - Test SolveTril custom operator via torch.ops.npu
-
-整算子测试（MCH 上片后）：
-    solve_tril 接口已收敛为 (x, chunk_size, cu_seqlens, chunk_indices, layout)，
-    不再有 MCH 输出 / 全 0 矩阵 / 单位矩阵 调试入参。算子对严格下三角 A 计算
-    完整的 (I + A)^{-1}（与 triton 参考 solve_tril_npu 的约定一致）。
-
-    算法分两段：MCH 求 16×16 对角块逆（块对角逆），MBH 递归合并非对角块得到完整下三角逆。
-    现状：MCH 已上片，其结果暂存于片上 UB（供 MBH 消费），尚未把最终结果写回 x_out。
-    因此在 MBH 上片完成前，本测试读取 x_out 不会通过——它是“完整算子”的目标回归测试，
-    待 MBH 写回 x_out 后即可全绿。MCH 阶段单独对拍请用 kernel 内 DumpTensor(ub_Res) 观测。
+Supports BSND [B,T,H,BT] and TND [total_T,H,BT] (varlen) layouts.
 """
 import torch
 import torch_npu
@@ -18,102 +9,239 @@ import fla_npu
 
 torch.npu.utils.set_device(0)
 
-FRAC = 16  # 叶子块大小（MCH 对角块）
 
-
-def solve_tril_golden(block):
-    """完整下三角逆 golden：(I + A)^{-1}，A 为 BT×BT 严格下三角 (float32 numpy)。"""
-    bt = block.shape[0]
-    eye = np.eye(bt, dtype=np.float32)
-    return np.linalg.inv(eye + block)
-
-
-def generate_lower_tri_block(bt, dtype=torch.float16, seed=42):
-    """生成单个 BT×BT 的严格下三角矩阵。"""
-    torch.manual_seed(seed)
-    m = torch.randn(bt, bt, dtype=dtype) * 0.1
-    for i in range(bt):
-        for j in range(i, bt):
-            m[i, j] = 0.0
-    return m
-
-
-def test_solve_tril(BT, layout="bhtd", dtype=torch.float16, seed=42):
-    """整算子单 tile 测试：B=H=1, T=BT，单个 chunk（与 kernel 当前单 tile 握手匹配）。"""
-    B, H, T, chunk_size = 1, 1, BT, BT
-
-    block = generate_lower_tri_block(BT, dtype, seed)              # BT×BT 严格下三角 A
-    block_np = block.float().numpy()
-    golden_np = solve_tril_golden(block_np)                       # 完整 (I+A)^{-1}
-
-    # 组织为算子输入张量（BHTD: [B,H,T,BT] / BSND: [B,T,H,BT]）
-    if layout == "bhtd":
-        A = block.reshape(B, H, T, chunk_size)
+def solve_tril_golden(A_tensor, chunk_size, layout="bsnd"):
+    """CPU golden: compute (I + A)^{-1} for each chunk, support non-aligned T."""
+    A = A_tensor.float().numpy()
+    if layout == "tnd":
+        T, H, BT = A.shape
+        B = 1
     else:
-        A = block.reshape(B, T, H, chunk_size)
+        B, T, H, BT = A.shape
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    result = np.zeros_like(A)
+
+    for b in range(B):
+        for h in range(H):
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                if layout == "tnd":
+                    block = A[s:e, h, :actual_size]
+                else:
+                    block = A[b, s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                M = eye + block
+                M_inv = np.linalg.inv(M)
+                if layout == "tnd":
+                    result[s:e, h, :actual_size] = M_inv
+                else:
+                    result[b, s:e, h, :actual_size] = M_inv
+    return torch.from_numpy(result).half()
+
+
+def generate_lower_tri_input(B, H, T, chunk_size, dtype=torch.float16, seed=42, layout="bsnd"):
+    """Generate random strictly lower triangular input."""
+    torch.manual_seed(seed)
+    if layout == "tnd":
+        A = torch.zeros(T, H, chunk_size, dtype=dtype)
+    else:
+        A = torch.zeros(B, T, H, chunk_size, dtype=dtype)
+    num_chunks = (T + chunk_size - 1) // chunk_size
+
+    for b in range(B):
+        for h in range(H):
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                one_chunk = torch.randn(actual_size, actual_size, dtype=dtype) * 0.1
+                for i in range(actual_size):
+                    for j in range(i, actual_size):
+                        one_chunk[i, j] = 0.0
+                if layout == "tnd":
+                    A[s:e, h, :actual_size] = one_chunk
+                else:
+                    A[b, s:e, h, :actual_size] = one_chunk
+    return A
+
+
+def test_solve_tril(B, H, T, chunk_size, layout="bsnd", dtype=torch.float16):
+    """Run one fixed-length test case."""
+    torch.manual_seed(42)
+    A = generate_lower_tri_input(B, H, T, chunk_size, dtype, layout=layout)
+    golden = solve_tril_golden(A, chunk_size, layout=layout)
 
     A_npu = A.npu()
-
-    out_npu = torch.ops.npu.npu_solve_tril(
-        A_npu, chunk_size,
-        cu_seqlens=None,
-        chunk_indices=None,
-        layout=layout,
-    )
+    out_npu = torch.ops.npu.npu_solve_tril(A_npu, chunk_size, layout=layout)
     out_cpu = out_npu.cpu()
 
-    if layout == "bhtd":
-        inv_block = out_cpu[0, 0].float().numpy()
-    else:
-        inv_block = out_cpu[0, :, 0].float().numpy()
+    num_chunks = (T + chunk_size - 1) // chunk_size
 
-    # 校验 1：与 CPU golden 的最大差
-    max_diff = np.abs(inv_block - golden_np).max()
-    # 校验 2：(I + A) @ out ≈ I（与约定无关的残差校验）
-    eye = np.eye(BT, dtype=np.float32)
-    product = (eye + block_np) @ inv_block
-    verify_err = np.abs(product - eye).max()
+    diff = (out_cpu.float() - golden.float()).abs()
+    max_diff = diff.max().item()
 
-    passed = verify_err < 1e-3
+    A_np = A.float().numpy()
+    R_np = out_cpu.float().numpy()
+    max_verify_err = 0.0
+    print(f"\n--- Test (layout={layout}, B={B}, H={H}, T={T}, BT={chunk_size}, numChunks={num_chunks}) ---")
+    for b in range(B):
+        for h in range(H):
+            for c in range(num_chunks):
+                s = c * chunk_size
+                e = min(s + chunk_size, T)
+                actual_size = e - s
+                if layout == "tnd":
+                    block = A_np[s:e, h, :actual_size]
+                    inv_block = R_np[s:e, h, :actual_size]
+                else:
+                    block = A_np[b, s:e, h, :actual_size]
+                    inv_block = R_np[b, s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                product = (eye + block) @ inv_block
+                err = np.abs(product - eye).max()
+                max_verify_err = max(max_verify_err, err)
+
+                golden_chunk = golden[h, s:e, :actual_size].float().numpy() if layout == "tnd" else golden[b, h, s:e, :actual_size].float().numpy()
+                chunk_diff = np.abs(inv_block - golden_chunk).max()
+                is_partial = (c == num_chunks - 1 and actual_size < chunk_size)
+                partial_tag = f" [partial {actual_size}x{actual_size}]" if is_partial else ""
+                cst = "OK" if err < 1e-3 else "FAIL"
+                print(f"  [{cst}] b={b} h={h} c={c}{partial_tag}: max_diff={chunk_diff:.6f}, verify_err={err:.6f}")
+
+    passed = max_verify_err < 1e-3
     status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] layout={layout} BT={BT}: "
-          f"max_diff={max_diff:.6f}, verify_err={verify_err:.6f}")
+    print(f"  [{status}] layout={layout} B={B} H={H} T={T} BT={chunk_size}: "
+          f"max_diff={max_diff:.6f}, verify_err={max_verify_err:.6f}")
+    return passed
 
-    # 失败时逐 16×16 子块定位（块数不多时）
-    if (not passed) and BT <= 64:
-        nf = BT // FRAC
-        print(f"      --- block-wise diagnosis (BT={BT}, {nf}x{nf} blocks of 16) ---")
-        for bi in range(nf):
-            row_err = []
-            for bj in range(nf):
-                o = inv_block[bi*FRAC:(bi+1)*FRAC, bj*FRAC:(bj+1)*FRAC]
-                g = golden_np[bi*FRAC:(bi+1)*FRAC, bj*FRAC:(bj+1)*FRAC]
-                tag = "diag" if bi == bj else ("low " if bi > bj else "up  ")
-                row_err.append(f"({bi},{bj}){tag} err={np.abs(o-g).max():.4f}")
-            print("        " + " | ".join(row_err))
+
+def test_solve_tril_varlen(seq_lens, H, chunk_size, dtype=torch.float16):
+    """Test THD varlen format [total_T, H, BT]."""
+    total_T = sum(seq_lens)
+    cu_seqlens = torch.tensor([0] + list(np.cumsum(seq_lens)), dtype=torch.int32)
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    num_chunks_per_seq = (lens + chunk_size - 1) // chunk_size
+
+    all_seq_ids = []
+    all_chunk_ids = []
+    for seq_idx, n_chunks in enumerate(num_chunks_per_seq):
+        n = n_chunks.item()
+        all_seq_ids.extend([seq_idx] * n)
+        all_chunk_ids.extend(range(n))
+    chunk_indices = torch.stack([
+        torch.tensor(all_seq_ids, dtype=torch.int32),
+        torch.tensor(all_chunk_ids, dtype=torch.int32)
+    ], dim=1)
+
+    torch.manual_seed(42)
+    A = torch.zeros(total_T, H, chunk_size, dtype=dtype)
+    num_seqs = len(seq_lens)
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                one_chunk = torch.randn(actual_size, actual_size, dtype=dtype) * 0.1
+                for i in range(actual_size):
+                    for j in range(i, actual_size):
+                        one_chunk[i, j] = 0.0
+                A[s:e, h, :actual_size] = one_chunk
+
+    A_np = A.float().numpy()
+    golden = np.zeros_like(A_np)
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                block = A_np[s:e, h, :actual_size]
+                eye = np.eye(actual_size, dtype=np.float32)
+                M = eye + block
+                M_inv = np.linalg.inv(M)
+                golden[s:e, h, :actual_size] = M_inv
+    golden = torch.from_numpy(golden).half()
+
+    A_npu = A.npu()
+    cu_seqlens_list = cu_seqlens.tolist()
+    chunk_indices_flat = chunk_indices.flatten().tolist()
+
+    out_npu = torch.ops.npu.npu_solve_tril(A_npu, chunk_size,
+                                           cu_seqlens=cu_seqlens_list,
+                                           chunk_indices=chunk_indices_flat,
+                                           layout="tnd")
+    out_cpu = out_npu.cpu()
+
+    max_verify_err = 0.0
+    total_chunks = chunk_indices.shape[0]
+    print(f"\n--- Varlen test (seqs={seq_lens}, H={H}, BT={chunk_size}, "
+          f"total_T={total_T}, total_chunks={total_chunks}) ---")
+
+    for seq_idx in range(num_seqs):
+        bos = cu_seqlens[seq_idx].item()
+        eos = cu_seqlens[seq_idx + 1].item()
+        seq_len = eos - bos
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        for h in range(H):
+            for c in range(num_chunks):
+                s = bos + c * chunk_size
+                e = min(s + chunk_size, eos)
+                actual_size = e - s
+                block = A_np[s:e, h, :actual_size]
+                inv_block = out_cpu[s:e, h, :actual_size].float().numpy()
+                eye = np.eye(actual_size, dtype=np.float32)
+                product = (eye + block) @ inv_block
+                err = np.abs(product - eye).max()
+                max_verify_err = max(max_verify_err, err)
+
+                golden_chunk = golden[s:e, h, :actual_size].float().numpy()
+                chunk_diff = np.abs(inv_block - golden_chunk).max()
+                is_partial = (actual_size < chunk_size)
+                partial_tag = f" [partial {actual_size}x{actual_size}]" if is_partial else ""
+                cst = "OK" if err < 1e-3 else "FAIL"
+                print(f"  [{cst}] seq={seq_idx} h={h} c={c}{partial_tag}: "
+                      f"max_diff={chunk_diff:.6f}, verify_err={err:.6f}")
+
+    passed = max_verify_err < 1e-3
+    status = "PASS" if passed else "FAIL"
+    print(f"  [{status}] varlen seqs={seq_lens}, H={H}, BT={chunk_size}: "
+          f"max_verify_err={max_verify_err:.6f}")
     return passed
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("SolveTril NPU Test - whole operator (torch.ops.npu)")
+    print("SolveTril NPU Test (torch.ops.npu)")
     print("=" * 60)
 
     results = []
 
-    # 整算子单 tile：BT=16/32/64/128
-    print("\n--- BHTD layout [B=1, H=1, T=BT, BT] ---")
-    for bt in (16, 32, 64, 128):
-        results.append(test_solve_tril(bt, layout="bhtd"))
+    # BSND layout tests
+    print("\n--- BSND layout [B, T, H, BT] ---")
+    results.append(test_solve_tril(1, 2, 64, 32, layout="bsnd"))
+    results.append(test_solve_tril(2, 2, 64, 32, layout="bsnd"))
+    results.append(test_solve_tril(1, 1, 35, 32, layout="bsnd"))
+    results.append(test_solve_tril(2, 2, 100, 32, layout="bsnd"))
 
-    print("\n--- BSND layout [B=1, T=BT, H=1, BT] ---")
-    for bt in (16, 32, 64, 128):
-        results.append(test_solve_tril(bt, layout="bsnd"))
-
-    # 不同随机种子，增强覆盖
-    print("\n--- BT=128, multiple seeds ---")
-    for sd in (1, 7, 123):
-        results.append(test_solve_tril(128, layout="bhtd", seed=sd))
+    # Varlen TND tests
+    print("\n--- TND varlen layout [total_T, H, BT] ---")
+    results.append(test_solve_tril_varlen([64], 1, 32))
+    results.append(test_solve_tril_varlen([32, 32, 32], 2, 32))
+    results.append(test_solve_tril_varlen([100, 50, 35], 2, 32))
+    results.append(test_solve_tril_varlen([35], 1, 32))
+    results.append(test_solve_tril_varlen([3], 1, 32))
+    results.append(test_solve_tril_varlen([18], 2, 32))
 
     print(f"\n{'='*60}")
     print(f"Results: {sum(results)}/{len(results)} passed")
